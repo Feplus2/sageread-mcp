@@ -20,8 +20,6 @@
 | `list_book_notes` | 划线/标注/书签（论文标注含星标/类别/来源，位置渲染为可读形式） | `book`，`type?` |
 | `export_thread_markdown` | 对话导出为 Markdown | `threadId` |
 | `list_tags` | 书库所有标签 | 无 |
-| `list_notes` | 独立笔记列表（可按书过滤） | `book?` |
-| `get_note` | 单条笔记完整内容 | `noteId` |
 | `list_skills` | AI 技能库（可选返回完整内容） | `include_content?` |
 | `get_paper_info` | 论文书目元数据（frontmatter + 中文标题/摘要 + 收藏文件夹，字段保持 Pandoc/CSL 原义） | `paper` 标题（模糊）或 id |
 | `get_paper_toc` | 论文目录（解析 paper.md 的标题层级） | `paper` 标题（模糊）或 id |
