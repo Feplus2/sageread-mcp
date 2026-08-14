@@ -19,6 +19,7 @@
 | `list_threads` | AI 对话列表 | `book?` 可按书过滤；`starred_only?` 只看星标；`scope?` 按作用域 |
 | `get_thread` | 对话完整内容 | `threadId` |
 | `list_book_notes` | 划线/标注/书签（论文标注含星标/类别/来源，位置渲染为可读形式） | `book`，`type?` |
+| `list_notes` | 读书笔记面板的 Markdown 笔记（notes 表，与划线标注不同源），按书/星标过滤 | `book?`，`starred?` |
 | `export_thread_markdown` | 对话导出为 Markdown | `threadId` |
 | `list_tags` | 书库所有标签 | 无 |
 | `list_skills` | AI 技能库（可选返回完整内容） | `include_content?` |
