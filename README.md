@@ -3,7 +3,8 @@
 [SageRead](https://github.com/xincmm/sageread) 阅读数据的 MCP server（**只读**）：让任何支持 MCP 的 AI Agent 查询你的书库、阅读进度、阅读时长、划线标注、AI 对话与论文库，并对向量库做语义检索。
 
 - **数据安全**：以 `readonly` 模式打开 SageRead 的 SQLite 数据库，不会以任何形式写入，不影响 SageRead 运行
-- **SageRead 不在运行也能用**（数据是本地文件；语义检索使用本地嵌入模型时除外，见下文）
+- **密钥不出 app**：语义检索的嵌入调用经 SageRead 本地通道转发，本进程不读取/不持有任何 API Key
+- **SageRead 不在运行时只读工具可用**（数据是本地文件）；`semantic_search` 需应用运行（嵌入在 app 内执行）
 - **论文支持**：读取论文目录、正文与分组，列出论文标注（含星标/类别/来源）
 - **语义检索**：基于 SageRead 的向量库（sqlite-vec）做自然语言近邻检索
 - **跨应用联动**：配合其他 MCP（如知识库类），可以让 Agent 完成"把某段阅读对话归档到知识库"这类操作
@@ -48,10 +49,11 @@ Title Case 转换（mla/chicago）做了保守处理：化学式/公式/含数�
 
 ## 语义检索说明
 
-`semantic_search` 需要用户先在 SageRead「设置 → 向量模型」中配置嵌入模型（外部 API 或本地下载模型），并在 SageRead 里对论文/书籍执行过向量化。sageread-mcp 从本机 `llama-store.json` 读取嵌入配置直接调用嵌入接口——**秘钥不出本机，Agent 只能看到查询文本与检索结果**。
+`semantic_search` 需要：① SageRead 应用正在运行（启动时会写 `mcp-local.json` 本地通道凭据）；
+② 已在「设置 → 向量模型」配置并选中向量模型；③ 对论文/书籍执行过向量化。
 
-- 未配置嵌入模型时，工具返回降级提示而不是报错崩溃
-- 使用本地嵌入模型时需要 SageRead 应用正在运行（本地嵌入服务随应用启动）
+查询文本的向量化由 **SageRead 应用内执行**（用当前选中模型与 keyring 密钥），sageread-mcp 只发文本、只收回向量——**API Key 绝不进入本进程**。未启动应用/未配置模型时，工具返回带引导的降级提示而非崩溃。
+
 - 查询向量维度与向量索引维度不一致时，会提示在 SageRead 中重建向量索引
 - `collection` 按收藏文件夹过滤论文（仅影响论文域），与 `paper_id` 同给时取交集
 

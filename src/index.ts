@@ -19,8 +19,15 @@ import { semanticSearch } from "./semantic-search.js";
 function resolveDbPath(): string {
   if (process.env.SAGEREAD_DB_PATH) return process.env.SAGEREAD_DB_PATH;
   const dev = process.argv.includes("--dev") || process.env.SAGEREAD_DEV === "1";
-  const appId = dev ? "com.xincmm.sageread.dev" : "com.xincmm.sageread";
-  return path.join(os.homedir(), "AppData", "Roaming", appId, "database", "app.db");
+  // Better SageRead（现名）优先；原版 SageRead 数据目录存在时自动回退（老用户库仍可查）
+  const appIds = dev
+    ? ["com.bettersageread.dev", "com.xincmm.sageread.dev"]
+    : ["com.bettersageread", "com.xincmm.sageread"];
+  for (const appId of appIds) {
+    const p = path.join(os.homedir(), "AppData", "Roaming", appId, "database", "app.db");
+    if (fs.existsSync(p)) return p;
+  }
+  return path.join(os.homedir(), "AppData", "Roaming", appIds[0], "database", "app.db");
 }
 
 const DB_PATH = resolveDbPath();
@@ -708,6 +715,66 @@ server.tool(
         最近阅读: fmtTime(r.last_read_at),
         添加时间: fmtTime(r.created_at),
         ...(r.trashed_at ? { 已删除: fmtTime(r.trashed_at) } : {}),
+      })),
+    );
+  },
+);
+
+server.tool(
+  "list_notes",
+  "列出读书笔记面板的笔记（notes 表：书内「笔记」标签页创建的 Markdown 笔记；与划线标注不同），可按书过滤，含标题、内容、位置锚点、星标与时间",
+  {
+    book: z.string().optional().describe("可选：书名（模糊）或书籍 id；不给则列出全部"),
+    starred: z.boolean().optional().describe("可选：只看星标笔记"),
+  },
+  async ({ book, starred }) => {
+    let rows: {
+      id: string;
+      book_id: string;
+      title: string;
+      content: string;
+      location_tag: string | null;
+      location_block: number | null;
+      location_cfi: string | null;
+      starred: number;
+      created_at: number;
+      updated_at: number;
+    }[];
+    const params: (string | number)[] = [];
+    let where = "";
+    if (book) {
+      const found = findBook(book);
+      if (!found) return fail(`未找到匹配的书籍: ${book}`);
+      where += " WHERE book_id = ?";
+      params.push(found.id);
+    }
+    if (starred) {
+      where += where ? " AND starred = 1" : " WHERE starred = 1";
+    }
+    try {
+      rows = db
+        .prepare(`SELECT * FROM notes${where} ORDER BY updated_at DESC`)
+        .all(...params) as typeof rows;
+    } catch (e) {
+      return fail(`读取 notes 表失败（数据库可能是旧版本，尚无笔记面板表结构）: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!rows.length) {
+      return ok(book ? "该书还没有笔记" : "还没有任何笔记");
+    }
+    const titleOf = (id: string): string => {
+      const b = db.prepare("SELECT title FROM books WHERE id = ?").get(id) as { title: string } | undefined;
+      return b?.title ?? id;
+    };
+    return ok(
+      rows.map((r) => ({
+        id: r.id,
+        书名: titleOf(r.book_id),
+        标题: r.title || null,
+        内容: r.content,
+        位置: r.location_tag ?? r.location_cfi ?? (r.location_block != null ? `块 ${r.location_block}` : null),
+        星标: r.starred === 1,
+        更新时间: fmtTime(r.updated_at),
+        创建时间: fmtTime(r.created_at),
       })),
     );
   },

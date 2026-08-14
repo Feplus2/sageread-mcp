@@ -1,115 +1,68 @@
 /**
- * 语义检索模块：读取 SageRead 的嵌入模型配置（llama-store.json），
- * 调用嵌入接口把查询文本向量化，再用 sqlite-vec 在 vectors.sqlite 里做近邻检索。
- * 本模块只读：向量库以 readonly 模式打开，用完即关。
+ * 语义检索模块：查询文本的向量化经 **SageRead 本地通道**完成（I2，密钥不出 app 进程），
+ * 再用 sqlite-vec 在 vectors.sqlite 里做近邻检索。本模块只读：向量库以 readonly 模式打开，用完即关。
+ *
+ * 本地通道：SageRead 启动时把 {port, token} 写入 appData/mcp-local.json，
+ * 本进程凭 token 调 `POST /embed`，app 用当前选中向量模型 + keyring 密钥执行嵌入，只回向量。
+ * 历史背景：早期版本直读 llama-store.json 的 apiKey 自调嵌入，批次 A 密钥迁入 keyring 后
+ * 该路径失效且违反“密钥不出 app”红线，故整体改道。
  */
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import fs from "node:fs";
 import path from "node:path";
 
-// ---------- 嵌入配置解析 ----------
+// ---------- 本地通道（app 侧嵌入） ----------
 
-interface VectorModelConfig {
-  url: string;
-  modelId: string;
-  apiKey: string;
-  dimension?: number;
+interface LocalChannel {
+  port: number;
+  token: string;
 }
 
-interface LlamaStore {
-  state?: {
-    vectorModels?: {
-      id: string;
-      name?: string;
-      url: string;
-      modelId: string;
-      apiKey?: string;
-      description?: string;
-      dimension?: number;
-    }[];
-    selectedVectorModelId?: string;
-    vectorModelEnabled?: boolean;
-    modelPath?: string;
-  };
-  version?: number;
-}
-
-const LOCAL_EMBED_URL = "http://127.0.0.1:3544/v1/embeddings";
-
-/**
- * 解析嵌入模型配置：
- * vectorModelEnabled===true 且 selectedVectorModelId 命中 → 外部模型；
- * 否则 modelPath 非空 → 本地嵌入服务；否则 null（未配置）。
- */
-function resolveVectorConfig(appDir: string): VectorModelConfig | null {
-  const storePath = path.join(appDir, "llama-store.json");
-  if (!fs.existsSync(storePath)) return null;
-  let store: LlamaStore;
+/** 读取 SageRead 写入的本地通道凭据（app 未运行时文件不存在/陈旧，连接失败时降级提示） */
+function readLocalChannel(appDir: string): LocalChannel | null {
+  const file = path.join(appDir, "mcp-local.json");
+  if (!fs.existsSync(file)) return null;
   try {
-    store = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  } catch {
-    return null;
-  }
-  const state = store.state;
-  if (!state) return null;
-  if (state.vectorModelEnabled === true && state.selectedVectorModelId) {
-    const model = (state.vectorModels ?? []).find((m) => m.id === state.selectedVectorModelId);
-    if (model) {
-      return {
-        url: model.url,
-        modelId: model.modelId,
-        apiKey: model.apiKey ?? "",
-        dimension: model.dimension,
-      };
+    const data = JSON.parse(fs.readFileSync(file, "utf8")) as { port?: number; token?: string };
+    if (typeof data.port === "number" && typeof data.token === "string" && data.token) {
+      return { port: data.port, token: data.token };
     }
-  }
-  if (state.modelPath) {
-    return { url: LOCAL_EMBED_URL, modelId: "local", apiKey: "" };
+  } catch {
+    // 文件损坏等同未启动
   }
   return null;
 }
 
-// ---------- 嵌入调用 ----------
-
-/** 调用嵌入接口，镜像主应用 Rust 侧 vectorizer.rs 的两种协议 */
-async function embedQuery(config: VectorModelConfig, text: string): Promise<number[]> {
-  const isOllama = config.url.endsWith("/api/embed");
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (config.apiKey) headers["Authorization"] = `Bearer ${config.apiKey}`;
-  const body = isOllama
-    ? { model: config.modelId, input: text }
-    : { input: [text], model: config.modelId, encoding_format: "float" };
-
+/** 经本地通道把查询文本向量化（嵌入在 app 内执行，本进程不接触任何密钥） */
+async function embedViaApp(appDir: string, text: string): Promise<number[]> {
+  const channel = readLocalChannel(appDir);
+  if (!channel) {
+    throw new Error("SageRead 未运行（未找到本地通道）：语义检索需要应用执行嵌入，请启动 SageRead 后重试");
+  }
   let res: Response;
   try {
-    res = await fetch(config.url, {
+    res = await fetch(`http://127.0.0.1:${channel.port}/embed`, {
       method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${channel.token}`,
+      },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(40_000),
     });
-  } catch (err) {
-    if (config.url.startsWith("http://127.0.0.1")) {
-      throw new Error(
-        "本地嵌入服务未运行（127.0.0.1:3544）：请启动 SageRead 应用，或在设置中改用外部嵌入模型",
-      );
+  } catch {
+    throw new Error("无法连接 SageRead 本地通道（应用可能已退出）：请启动 SageRead 后重试");
+  }
+  const data = (await res.json().catch(() => ({}))) as { vector?: number[]; error?: string };
+  if (!res.ok || !Array.isArray(data.vector) || data.vector.length === 0) {
+    const reason = data.error ?? `HTTP ${res.status}`;
+    if (/未启用外部向量模型|未选择向量模型/.test(reason)) {
+      throw new Error(`SageRead 向量模型未就绪：${reason}（设置 → 向量模型）`);
     }
-    throw new Error(`嵌入接口请求失败：${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`本地通道嵌入失败：${reason}`);
   }
-  if (!res.ok) {
-    const detail = (await res.text().catch(() => "")).slice(0, 200);
-    throw new Error(`嵌入接口返回 ${res.status}：${detail}`);
-  }
-  const data = (await res.json()) as {
-    embeddings?: number[][];
-    data?: { embedding: number[] }[];
-  };
-  const vector = isOllama ? data.embeddings?.[0] : data.data?.[0]?.embedding;
-  if (!Array.isArray(vector) || vector.length === 0) {
-    throw new Error("嵌入接口响应中没有向量数据");
-  }
-  return vector;
+  return data.vector;
 }
 
 // ---------- 向量库检索 ----------
@@ -232,13 +185,9 @@ export async function semanticSearch(
 ): Promise<SemanticSearchResult> {
   const { query, scope, paperId, paperIds, bookId, topK } = options;
 
-  const config = resolveVectorConfig(appDir);
-  if (!config) {
-    throw new Error(
-      "未配置嵌入模型：请先在 SageRead「设置 → 向量模型」中配置外部嵌入模型，或下载本地嵌入模型后再试",
-    );
-  }
-  const queryVector = await embedQuery(config, query);
+  // I2：嵌入经 SageRead 本地通道（app 用自己的 keyring 密钥执行，本进程不碰密钥）；
+  // app 未运行/向量模型未配置时 embedViaApp 抛带引导的降级错误
+  const queryVector = await embedViaApp(appDir, query);
 
   const rows: { row: ChunkRow; fallbackBookId?: string }[] = [];
 
