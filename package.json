@@ -8,10 +8,30 @@
   },
   "scripts": {
     "build": "tsc",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "tsc --watch",
-    "smoke": "node scripts/smoke-test.mjs"
+    "smoke": "node scripts/smoke-test.mjs",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "license": "MIT",
+  "author": "Feplus2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Feplus2/sageread-mcp.git"
+  },
+  "homepage": "https://github.com/Feplus2/sageread-mcp#readme",
+  "bugs": "https://github.com/Feplus2/sageread-mcp/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "sageread",
+    "better-sageread",
+    "zotero",
+    "research"
+  ],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=18"
   },

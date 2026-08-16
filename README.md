@@ -1,6 +1,8 @@
 # sageread-mcp
 
-[SageRead](https://github.com/xincmm/sageread) 阅读数据的 MCP server（**只读**）：让任何支持 MCP 的 AI Agent 查询你的书库、阅读进度、阅读时长、划线标注、AI 对话与论文库，并对向量库做语义检索。
+[Better SageRead](https://github.com/Feplus2/better-sageread) 阅读数据的 MCP server（**只读**）：让任何支持 MCP 的 AI Agent 查询你的书库、阅读进度、阅读时长、划线标注、AI 对话与论文库，并对向量库做语义检索。
+
+Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sageread) 发展的独立维护版；本 MCP 同时兼容两者的数据目录（优先读 Better SageRead，见「数据目录」一节）。
 
 - **数据安全**：以 `readonly` 模式打开 SageRead 的 SQLite 数据库，不会以任何形式写入，不影响 SageRead 运行
 - **密钥不出 app**：语义检索的嵌入调用经 SageRead 本地通道转发，本进程不读取/不持有任何 API Key
@@ -26,7 +28,7 @@
 | `get_paper_info` | 论文书目元数据（frontmatter + 中文标题/摘要 + 收藏文件夹，字段保持 Pandoc/CSL 原义） | `paper` 标题（模糊）或 id |
 | `get_paper_toc` | 论文目录（解析 paper.md 的标题层级） | `paper` 标题（模糊）或 id |
 | `read_paper` | 论文正文切片（offset/limit 分段阅读） | `paper`，`offset?`，`limit?`（默认 30000，上限 60000） |
-| `read_paper_section` | 按小节标题读论文章节 | `paper`，`heading` |
+| `read_paper_section` | 按小节标题读论文章节（超 30000 字符截断并标注小节总长度） | `paper`，`heading` |
 | `list_paper_folders` | 论文分组（文件夹/颜色/包含论文） | 无 |
 | `list_papers` | 批量文献卡片（书目信息一览，供初筛） | `collection?`，`include_abstract?`，`limit?`（默认 50，上限 200） |
 | `export_paper_citation` | 导出参考文献引用（8 种格式，见下），单篇或整个收藏文件夹 | `paper?`，`collection?`（两者至少给一个），`format?`（默认 bibtex） |
@@ -67,12 +69,12 @@ npm run smoke        # 冒烟测试（连真实开发版数据库走一遍）
 SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 semantic_search 的真实嵌入调用
 ```
 
-要求 Node.js >= 18。
+要求 Node.js >= 18；目前仅支持 Windows（数据目录路径按 `%APPDATA%` 解析）。
 
 ## 数据目录
 
-- 默认读**发行版**：`%APPDATA%\com.xincmm.sageread\database\app.db`
-- `--dev` 参数或 `SAGEREAD_DEV=1`：读开发版（`com.xincmm.sageread.dev`）
+- 默认读 **Better SageRead 发行版**：`%APPDATA%\com.bettersageread\database\app.db`；不存在时回退上游 SageRead（`com.xincmm.sageread`）
+- `--dev` 参数或 `SAGEREAD_DEV=1`：读开发版（`com.bettersageread.dev`，回退 `com.xincmm.sageread.dev`）
 - `SAGEREAD_DB_PATH`：完全自定义 db 路径
 
 ## 客户端配置
@@ -85,12 +87,14 @@ SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 semantic_search 的真实嵌入�
 {
   "mcpServers": {
     "sageread": {
-      "command": "node",
-      "args": ["F:/MyProjects/sageread-mcp/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "sageread-mcp"]
     }
   }
 }
 ```
+
+`--dev` 仅当你使用开发版数据目录时加（放在 args 末尾）。
 
 ### Cherry Studio
 
@@ -100,8 +104,30 @@ SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 semantic_search 的真实嵌入�
 {
   "mcpServers": {
     "sageread": {
+      "command": "npx",
+      "args": ["-y", "sageread-mcp"]
+    }
+  }
+}
+```
+
+### 从源码构建（备选）
+
+```bash
+git clone https://github.com/Feplus2/sageread-mcp.git
+cd sageread-mcp
+npm install
+npm run build
+```
+
+然后以 `node` 直接启动（路径按实际位置替换）：
+
+```json
+{
+  "mcpServers": {
+    "sageread": {
       "command": "node",
-      "args": ["F:/MyProjects/sageread-mcp/dist/index.js", "--dev"]
+      "args": ["<path-to>/sageread-mcp/dist/index.js"]
     }
   }
 }
@@ -113,4 +139,4 @@ SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 semantic_search 的真实嵌入�
 
 ## 许可证
 
-AGPL-3.0（与 SageRead 一致）
+MIT
