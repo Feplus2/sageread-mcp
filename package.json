@@ -1,6 +1,6 @@
 {
   "name": "sageread-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "书库/论文/笔记/对话/向量语义检索的 SageRead 只读 MCP",
   "type": "module",
   "bin": {
