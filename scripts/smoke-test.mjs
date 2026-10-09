@@ -217,7 +217,7 @@ if (paperBook) {
     assert(ris.text.trimEnd().endsWith("ER  -"), "ris: ER 结尾");
   }
 
-  const ctx = await callTool("get_chunk_context", { paper_id: paperBook.id, chunk_order: 63, radius: 1 });
+  const ctx = await callTool("get_chunk_context", { id: paperBook.id, chunk_order: 63, radius: 1 });
   show("get_chunk_context(chunk 63, radius=1)（截断）", ctx.text, 1200);
 } else {
   console.log("\n- 未找到 MARKDOWN 论文，跳过 get_paper_toc / read_paper / read_paper_section / export_paper_citation / get_chunk_context 冒烟");

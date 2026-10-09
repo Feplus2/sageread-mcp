@@ -16,18 +16,48 @@ import { semanticSearch } from "./semantic-search.js";
 
 // ---------- 数据路径解析 ----------
 
+const APPDATA_DIR = path.join(os.homedir(), "AppData", "Roaming");
+
+function dbPathIn(appDir: string): string {
+  return path.join(appDir, "database", "app.db");
+}
+
+/** 数据目录“最后活动时间”：取 app.db 与 mcp-local.json 两者 mtime 的较新值，用于挑选当前活动实例 */
+function lastActivity(appDir: string, dbPath: string): number {
+  let t = 0;
+  for (const f of [dbPath, path.join(appDir, "mcp-local.json")]) {
+    try {
+      const m = fs.statSync(f).mtimeMs;
+      if (m > t) t = m;
+    } catch {
+      // 文件缺失则忽略
+    }
+  }
+  return t;
+}
+
 function resolveDbPath(): string {
   if (process.env.SAGEREAD_DB_PATH) return process.env.SAGEREAD_DB_PATH;
   const dev = process.argv.includes("--dev") || process.env.SAGEREAD_DEV === "1";
-  // Better SageRead（现名）优先；原版 SageRead 数据目录存在时自动回退（老用户库仍可查）
-  const appIds = dev
-    ? ["com.bettersageread.dev", "com.xincmm.sageread.dev"]
-    : ["com.bettersageread", "com.xincmm.sageread"];
-  for (const appId of appIds) {
-    const p = path.join(os.homedir(), "AppData", "Roaming", appId, "database", "app.db");
-    if (fs.existsSync(p)) return p;
+  // 扫描 %APPDATA% 下所有 Better SageRead / 原版 SageRead 数据目录，按 --dev 归类，
+  // 选“最近活动”的实例。发行版目录名带 .app、开发版带 .dev/.dev2… 变体繁多，
+  // 硬编码 id 列表会漏掉当前发行版（com.bettersageread.app）导致误连旧库或启动失败。
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(APPDATA_DIR);
+  } catch {
+    entries = [];
   }
-  return path.join(os.homedir(), "AppData", "Roaming", appIds[0], "database", "app.db");
+  const candidate = entries
+    .filter((name) => /^com\.(bettersageread|xincmm\.sageread)/i.test(name))
+    .filter((name) => !name.includes(".bak")) // 排除显式备份目录
+    .filter((name) => (dev ? name.includes(".dev") : !name.includes(".dev")))
+    .map((name) => path.join(APPDATA_DIR, name))
+    .filter((dir) => fs.existsSync(dbPathIn(dir)))
+    .sort((a, b) => lastActivity(b, dbPathIn(b)) - lastActivity(a, dbPathIn(a)));
+  if (candidate.length) return dbPathIn(candidate[0]);
+  // 无任何候选：回退到约定路径，让下方 existsSync 检查给出“数据库不存在”的明确报错
+  return dbPathIn(path.join(APPDATA_DIR, dev ? "com.bettersageread.dev" : "com.bettersageread.app"));
 }
 
 const DB_PATH = resolveDbPath();
@@ -214,6 +244,122 @@ function readPaperMetaJson(bookId: string): { title_zh?: string; abstract_zh?: s
   } catch {
     return {};
   }
+}
+
+// ---------- 书籍（EPUB / mdbook）目录与正文直读辅助 ----------
+
+interface BookTocEntry {
+  level: number;
+  title: string;
+  /** 正文 md 文件名（basename，如 part003.md） */
+  file?: string;
+  /** 正文 md 绝对路径 */
+  filePath?: string;
+}
+
+/** 读取 books/{bookId}/metadata.json 的 base_dir（导入时写死的 OEBPS 绝对路径，数据目录迁移后可能失效） */
+function readBookBaseDir(bookId: string): string | undefined {
+  const file = path.join(APP_DIR, "books", bookId, "metadata.json");
+  if (!fs.existsSync(file)) return undefined;
+  try {
+    const doc = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    return typeof doc.base_dir === "string" ? doc.base_dir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 在 root 下递归查找含 nav.md 的目录（即 OEBPS 目录），限定深度避免全盘扫描 */
+function scanForNavDir(root: string, depth = 6): string | undefined {
+  if (depth < 0) return undefined;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  if (entries.some((e) => e.isFile() && e.name === "nav.md")) return root;
+  for (const e of entries) {
+    if (e.isDirectory()) {
+      const hit = scanForNavDir(path.join(root, e.name), depth - 1);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+/** 定位书籍 OEBPS 目录（nav.md 与 Text/*.md 所在处）：优先 metadata.json 的 base_dir，回退递归扫描 */
+function findBookOebpsDir(bookId: string): string | undefined {
+  const base = readBookBaseDir(bookId);
+  if (base && fs.existsSync(path.join(base, "nav.md"))) return base;
+  const mdbookRoot = path.join(APP_DIR, "books", bookId, "mdbook");
+  const scanned = fs.existsSync(mdbookRoot) ? scanForNavDir(mdbookRoot) : undefined;
+  if (scanned) return scanned;
+  // base_dir 可能缺 nav.md 但仍是正文锚点
+  if (base && fs.existsSync(base)) return base;
+  return undefined;
+}
+
+/** 解析 nav.md 层级目录：缩进/4=层级，前导编号可选，形如「1.  [标题](Text/partNNN.md)」 */
+function parseNavToc(oebpsDir: string): BookTocEntry[] {
+  const navFile = path.join(oebpsDir, "nav.md");
+  if (!fs.existsSync(navFile)) return [];
+  const out: BookTocEntry[] = [];
+  const re = /^(\s*)(?:(\d+)\.\s+)?\[([^\]]+)\]\(([^)]+)\)/;
+  for (const line of fs.readFileSync(navFile, "utf8").split(/\r?\n/)) {
+    const m = re.exec(line);
+    if (!m) continue;
+    const indent = m[1].replace(/\t/g, "    ").length;
+    const href = m[4].trim().split("#")[0];
+    if (!href) continue;
+    const filePath = path.resolve(oebpsDir, href);
+    out.push({ level: Math.floor(indent / 4) + 1, title: m[3].trim(), file: path.basename(href), filePath });
+  }
+  return out;
+}
+
+/** 列出正文 md 文件（绝对路径，按名排序）：Text/ 子目录优先，补充 OEBPS 直下的 md（排除 nav.md） */
+function listBookTextFiles(oebpsDir: string): string[] {
+  const files: string[] = [];
+  const textDir = path.join(oebpsDir, "Text");
+  try {
+    if (fs.existsSync(textDir)) {
+      for (const n of fs.readdirSync(textDir)) {
+        if (n.toLowerCase().endsWith(".md")) files.push(path.join(textDir, n));
+      }
+    }
+    for (const e of fs.readdirSync(oebpsDir, { withFileTypes: true })) {
+      if (e.isFile() && e.name.toLowerCase().endsWith(".md") && e.name !== "nav.md") {
+        files.push(path.join(oebpsDir, e.name));
+      }
+    }
+  } catch {
+    // 目录不可读则返回已收集部分
+  }
+  return files.sort();
+}
+
+/** 把 read_book 的 file 参数解析为正文绝对路径：文件名精确 > 标题（精确>前缀>包含）；多命中返回歧义清单 */
+function resolveBookFile(
+  oebpsDir: string,
+  ref: string,
+): { filePath?: string; ambiguous?: BookTocEntry[]; error?: string } {
+  const textFiles = listBookTextFiles(oebpsDir);
+  const norm = ref.trim().toLowerCase().replace(/\\/g, "/");
+  const bareBase = path.basename(norm).replace(/\.md$/, "");
+  const byName = textFiles.find((f) => path.basename(f).toLowerCase().replace(/\.md$/, "") === bareBase);
+  if (byName) return { filePath: byName };
+  const toc = parseNavToc(oebpsDir).filter((e) => e.filePath);
+  const needle = ref.trim().toLowerCase();
+  for (const tier of [
+    toc.filter((e) => e.title!.toLowerCase() === needle),
+    toc.filter((e) => e.title!.toLowerCase().startsWith(needle)),
+    toc.filter((e) => e.title!.toLowerCase().includes(needle)),
+  ]) {
+    if (tier.length === 1) return { filePath: tier[0].filePath };
+    if (tier.length > 1) return { ambiguous: tier };
+  }
+  return { error: `未找到与「${ref}」匹配的文件名或章节标题` };
 }
 
 /** frontmatter 作者字段归一化为字符串数组（支持 "name" 或 {name: "..."} 两种形态） */
@@ -1431,13 +1577,13 @@ server.tool(
   "get_chunk_context",
   "按块序号取语义检索命中块的上下文（前后各扩 radius 块拼接，当前块有标记）；论文与书籍均支持",
   {
-    paper_id: z.string().describe("论文/书籍 id 或书名（模糊）；对应 semantic_search 结果 出处.id"),
+    id: z.string().describe("目标 id 或名称（模糊）：书籍传 book id、论文传 paper id；对应 semantic_search 结果 出处.id"),
     chunk_order: z.number().int().min(0).describe("命中块的序号（semantic_search 结果 块位置 的分子，即 chunk_order_in_file）"),
     radius: z.number().int().min(0).max(3).optional().describe("可选：前后各扩几块，默认 1，上限 3"),
   },
-  async ({ paper_id, chunk_order, radius }) => {
-    const found = findBook(paper_id);
-    if (!found) return fail(`未找到匹配的书籍: ${paper_id}`);
+  async ({ id, chunk_order, radius }) => {
+    const found = findBook(id);
+    if (!found) return fail(`未找到匹配的书籍: ${id}`);
     const r = radius ?? 1;
     const isPaper = found.format === "MARKDOWN";
     // 论文共用 {appDir}/papers/vectors.sqlite；书籍一书一库
@@ -1504,6 +1650,75 @@ server.tool(
     } finally {
       vdb.close();
     }
+  },
+);
+
+server.tool(
+  "get_book_toc",
+  "获取书籍（EPUB）目录：解析 mdbook 的 nav.md，按层级列出各章标题及正文文件名（供 read_book 使用）",
+  { book: z.string().describe("书名（模糊）或 book id") },
+  async ({ book }) => {
+    const found = findBook(book);
+    if (!found) return fail(`未找到匹配的书籍: ${book}`);
+    if (found.format === "MARKDOWN") return fail(`《${found.title}》是论文（MARKDOWN）：请改用 get_paper_toc`);
+    const oebps = findBookOebpsDir(found.id);
+    if (!oebps) {
+      return fail(`未找到《${found.title}》的 mdbook 目录：该书可能尚未完成 EPUB→mdbook 转换，请在 SageRead 中重新打开后再试`);
+    }
+    let toc = parseNavToc(oebps);
+    let source = "nav.md";
+    if (!toc.length) {
+      // nav.md 缺失或无法解析：回退到正文 md 文件清单
+      toc = listBookTextFiles(oebps).map((f) => ({
+        level: 1,
+        title: path.basename(f, ".md"),
+        file: path.basename(f),
+        filePath: f,
+      }));
+      source = "Text 文件清单（nav.md 不可用）";
+    }
+    if (!toc.length) return fail(`《${found.title}》没有可解析的目录或正文文件`);
+    const lines = toc.map((e) => `${"  ".repeat(e.level - 1)}- ${e.title}${e.file ? `  [${e.file}]` : ""}`);
+    return ok(
+      `《${found.title}》目录（来源：${source}，共 ${toc.length} 条）：\n${lines.join("\n")}\n\n` +
+        `提示：用 read_book(book, file) 读取某章正文，file 传方括号内的文件名（如 part003.md）或章节标题。`,
+    );
+  },
+);
+
+server.tool(
+  "read_book",
+  "读取书籍（EPUB）某章正文：直读 mdbook 的 md 文件，用 offset/limit 分段读长章，不受 get_chunk_context 的 3 块上限约束",
+  {
+    book: z.string().describe("书名（模糊）或 book id"),
+    file: z.string().describe("章节文件名（如 part003.md，见 get_book_toc 方括号内）或章节标题（模糊匹配）"),
+    offset: z.number().int().min(0).optional().describe("可选：起始字符位置，默认 0"),
+    limit: z.number().int().min(1).max(60000).optional().describe("可选：读取字符数，默认 30000，上限 60000"),
+  },
+  async ({ book, file, offset, limit }) => {
+    const found = findBook(book);
+    if (!found) return fail(`未找到匹配的书籍: ${book}`);
+    if (found.format === "MARKDOWN") return fail(`《${found.title}》是论文（MARKDOWN）：请改用 read_paper / read_paper_section`);
+    const oebps = findBookOebpsDir(found.id);
+    if (!oebps) return fail(`未找到《${found.title}》的 mdbook 目录：该书可能尚未完成 EPUB→mdbook 转换`);
+    const resolved = resolveBookFile(oebps, file);
+    if (resolved.ambiguous) {
+      const list = resolved.ambiguous.map((e) => `- ${e.title}  [${e.file ?? ""}]`).join("\n");
+      return fail(`「${file}」匹配到多个章节，请指定其一（传文件名更精确）：\n${list}`);
+    }
+    if (!resolved.filePath) return fail(resolved.error ?? `未找到与「${file}」匹配的章节`);
+    if (!fs.existsSync(resolved.filePath)) return fail(`正文文件不存在（${resolved.filePath}）`);
+    const content = fs.readFileSync(resolved.filePath, "utf8");
+    const start = offset ?? 0;
+    const size = limit ?? 30000;
+    if (start >= content.length) return fail(`offset ${start} 超出全文长度（本章共 ${content.length} 字符）`);
+    const slice = content.slice(start, start + size);
+    const truncated = start + size < content.length;
+    const name = path.basename(resolved.filePath);
+    return ok(
+      `《${found.title}》· ${name}（本章共 ${content.length} 字符）\n\n${slice}` +
+        (truncated ? `\n\n(已截断，下一 offset=${start + size})` : ""),
+    );
   },
 );
 

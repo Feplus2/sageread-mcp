@@ -174,7 +174,7 @@ function toItem(row: ChunkRow, rank: number, fallbackBookId?: string): SemanticS
       块位置: `${row.chunk_order_in_file ?? "?"}/${row.total_chunks_in_file ?? "?"}`,
     },
     ...(id !== null && typeof row.chunk_order_in_file === "number"
-      ? { 上下文提示: `get_chunk_context(paper_id='${id}', chunk_order=${row.chunk_order_in_file})` }
+      ? { 上下文提示: `get_chunk_context(id='${id}', chunk_order=${row.chunk_order_in_file})` }
       : {}),
   };
 }

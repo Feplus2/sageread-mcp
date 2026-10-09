@@ -8,6 +8,7 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 - **密钥不出 app**：语义检索的嵌入调用经 SageRead 本地通道转发，本进程不读取/不持有任何 API Key
 - **SageRead 不在运行时只读工具可用**（数据是本地文件）；`semantic_search` 需应用运行（嵌入在 app 内执行）
 - **论文支持**：读取论文目录、正文与分组，列出论文标注（含星标/类别/来源）
+- **书籍直读**：`get_book_toc` / `read_book` 解析 EPUB 的 mdbook 目录并直读整章正文（不再只能靠 3 块上下文拼接）
 - **语义检索**：基于 SageRead 的向量库（sqlite-vec）做自然语言近邻检索
 - **跨应用联动**：配合其他 MCP（如知识库类），可以让 Agent 完成"把某段阅读对话归档到知识库"这类操作
 
@@ -33,9 +34,11 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 | `list_papers` | 批量文献卡片（书目信息一览，供初筛） | `collection?`，`include_abstract?`，`limit?`（默认 50，上限 200） |
 | `export_paper_citation` | 导出参考文献引用（8 种格式，见下），单篇或整个收藏文件夹 | `paper?`，`collection?`（两者至少给一个），`format?`（默认 bibtex） |
 | `semantic_search` | 向量库语义检索（默认论文库） | `query`，`scope?`（papers/books/all），`paper_id?`，`collection?`（收藏文件夹过滤），`book_id?`，`top_k?`（默认 8，上限 30） |
-| `get_chunk_context` | 取语义检索命中块的上下文（前后各扩 radius 块，当前块有标记） | `paper_id`，`chunk_order`，`radius?`（默认 1，上限 3） |
+| `get_chunk_context` | 取语义检索命中块的上下文（前后各扩 radius 块，当前块有标记） | `id`（书籍传 book id、论文传 paper id），`chunk_order`，`radius?`（默认 1，上限 3） |
+| `get_book_toc` | 书籍（EPUB）目录：解析 mdbook 的 nav.md，按层级列出各章标题及正文文件名 | `book` 书名（模糊）或 id |
+| `read_book` | 读取书籍某章正文（直读 mdbook 的 md 文件，offset/limit 分段；不受 `get_chunk_context` 3 块上限约束） | `book`，`file`（文件名如 part003.md 或章节标题），`offset?`，`limit?`（默认 30000，上限 60000） |
 
-论文工具（`get_paper_info` / `get_paper_toc` / `read_paper` / `read_paper_section`）仅支持 MARKDOWN 格式的论文书籍，其他格式会返回明确错误。
+论文工具（`get_paper_info` / `get_paper_toc` / `read_paper` / `read_paper_section`）仅支持 MARKDOWN 格式的论文书籍；书籍工具（`get_book_toc` / `read_book`）面向 EPUB 等普通书籍，两者互斥，误用会返回明确的重定向提示。
 
 `export_paper_citation` 的 `format` 支持 8 种格式：
 
@@ -59,6 +62,7 @@ Title Case 转换（mla/chicago）做了保守处理：化学式/公式/含数�
 
 - 查询向量维度与向量索引维度不一致时，会提示在 SageRead 中重建向量索引
 - `collection` 按收藏文件夹过滤论文（仅影响论文域），与 `paper_id` 同给时取交集
+- **相似度数值偏低不代表没命中**：返回的「相似度」是向量距离换算值，受嵌入模型与文本长度影响很大，实测有 17% 相似度却内容完全正确的命中。**不要按相似度阈值过滤结果**，应逐条看内容与出处判断相关性
 
 ## 安装与构建
 
@@ -73,9 +77,9 @@ SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 semantic_search 的真实嵌入�
 
 ## 数据目录
 
-- 默认读 **Better SageRead 发行版**：`%APPDATA%\com.bettersageread\database\app.db`；不存在时回退上游 SageRead（`com.xincmm.sageread`）
-- `--dev` 参数或 `SAGEREAD_DEV=1`：读开发版（`com.bettersageread.dev`，回退 `com.xincmm.sageread.dev`）
-- `SAGEREAD_DB_PATH`：完全自定义 db 路径
+- **默认自动选活动实例**：扫描 `%APPDATA%` 下所有 `com.bettersageread*` / `com.xincmm.sageread*` 数据目录（发行版目录名可能是 `com.bettersageread.app` 等变体），排除 `.bak` 备份，在含 `database\app.db` 的候选中挑「最近活动」的一个（按 `app.db` 与 `mcp-local.json` 的修改时间取较新者排序）。因此无需硬编码目录名，同时装着 Better SageRead 与上游 SageRead、或多个版本并存时也能自动连到当前在用的那个
+- `--dev` 参数或 `SAGEREAD_DEV=1`：只在开发版目录（名字含 `.dev`，如 `com.bettersageread.dev`）中选活动实例
+- `SAGEREAD_DB_PATH`：完全自定义 db 路径，**优先级最高**（设置后跳过上述扫描）
 
 ## 客户端配置
 
@@ -136,6 +140,13 @@ npm run build
 ### Kimi CLI
 
 见 `config.toml` 的 `mcp_servers` 一节（stdio 类型，command + args 同上）。
+
+### 无 MCP 客户端时直接驱动 stdio（进阶）
+
+本 server 是标准 stdio JSON-RPC，任何能起子进程、按行读写 stdin/stdout 的 Agent 都能直接驱动（`initialize` → `notifications/initialized` → `tools/list` / `tools/call`）。
+
+- **Windows 注意**：部分 Agent 环境（如经 Git Bash / Python 调用）里的 `node` 是 shell/cmd shim，用 `CreateProcess` 直接执行会报 `WinError 2`。此时需经 `cmd /c node ...` 包装，或在 `command` 里写 `node` 的绝对真实路径（`where node` 查）。
+- 不想依赖自动扫描时，用 `SAGEREAD_DB_PATH` 显式指定 db 路径最稳妥（`semantic_search` 会据此反推 app 数据目录去找 `mcp-local.json`）。
 
 ## 许可证
 
