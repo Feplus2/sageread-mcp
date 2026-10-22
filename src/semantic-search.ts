@@ -101,6 +101,13 @@ function searchVectorDb(
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     sqliteVec.load(db);
+    // 空/损坏的 vectors.sqlite（只有表结构、没有向量表）不应拖垮跨库检索：给出明确原因由上层跳过
+    const hasEmbeddingTable = db
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'chunk_embeddings'`)
+      .get() as { ok: number } | undefined;
+    if (!hasEmbeddingTable) {
+      throw new Error("向量库缺少 chunk_embeddings 表（可能尚未完成向量化或索引已损坏）");
+    }
     const indexDim = readIndexDimension(db);
     if (indexDim !== null && indexDim !== queryVector.length) {
       throw new Error(
@@ -153,6 +160,8 @@ export interface SemanticSearchResult {
   范围: string;
   结果数: number;
   结果: SemanticSearchItem[];
+  /** 跨库检索时被跳过的不可用向量库（单库损坏不影响其它库返回） */
+  警告?: string[];
 }
 
 const CONTENT_MAX = 800;
@@ -190,6 +199,8 @@ export async function semanticSearch(
   const queryVector = await embedViaApp(appDir, query);
 
   const rows: { row: ChunkRow; fallbackBookId?: string }[] = [];
+  // 跨库检索时单个库不可用（空库/维度不一致等）只跳过并记录，不让整次检索失败
+  const warnings: string[] = [];
 
   // 论文库：多论文共存一库；按 paper_id / 文件夹集合过滤时 k 放大（vec0 MATCH 是全局 top-k）
   if (scope === "papers" || scope === "all") {
@@ -203,16 +214,22 @@ export async function semanticSearch(
         );
       }
     } else if (!intersectEmpty) {
-      const needFilter = paperId !== undefined || paperIds !== undefined;
-      const k = needFilter ? Math.max(topK * 10, 100) : topK;
-      let found = searchVectorDb(papersDb, queryVector, k);
-      if (paperIds !== undefined) {
-        const set = new Set(paperIds);
-        found = found.filter((r) => r.paper_id !== null && set.has(r.paper_id));
+      try {
+        const needFilter = paperId !== undefined || paperIds !== undefined;
+        const k = needFilter ? Math.max(topK * 10, 100) : topK;
+        let found = searchVectorDb(papersDb, queryVector, k);
+        if (paperIds !== undefined) {
+          const set = new Set(paperIds);
+          found = found.filter((r) => r.paper_id !== null && set.has(r.paper_id));
+        }
+        if (paperId) found = found.filter((r) => r.paper_id === paperId);
+        if (needFilter) found = found.slice(0, topK);
+        rows.push(...found.map((row) => ({ row })));
+      } catch (err) {
+        // 只查论文库时保持原行为（明确报错）；跨库（all）时论文库坏了仍返回书籍结果
+        if (scope === "papers") throw err;
+        warnings.push(`论文库检索失败，已跳过：${err instanceof Error ? err.message : String(err)}`);
       }
-      if (paperId) found = found.filter((r) => r.paper_id === paperId);
-      if (needFilter) found = found.slice(0, topK);
-      rows.push(...found.map((row) => ({ row })));
     }
   }
 
@@ -240,8 +257,14 @@ export async function semanticSearch(
       const dbPath = path.join(booksRoot, dir, "vectors.sqlite");
       if (!fs.existsSync(dbPath)) continue;
       anyDb = true;
-      const found = searchVectorDb(dbPath, queryVector, topK);
-      rows.push(...found.map((row) => ({ row, fallbackBookId: dir })));
+      try {
+        const found = searchVectorDb(dbPath, queryVector, topK);
+        rows.push(...found.map((row) => ({ row, fallbackBookId: dir })));
+      } catch (err) {
+        // 显式指定单本书时保持明确报错；枚举书库/跨库时跳过坏库并继续
+        if (bookId) throw err;
+        warnings.push(`书籍 ${dir} 的向量库检索失败，已跳过：${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     if (!anyDb && scope === "books" && !bookId) {
       throw new Error("没有任何书籍的向量库：请先在 SageRead 里对书籍执行向量化后再试");
@@ -251,5 +274,11 @@ export async function semanticSearch(
   rows.sort((a, b) => a.row.distance - b.row.distance);
   const items = rows.slice(0, topK).map(({ row, fallbackBookId }, i) => toItem(row, i + 1, fallbackBookId));
 
-  return { 查询: query, 范围: scope, 结果数: items.length, 结果: items };
+  return {
+    查询: query,
+    范围: scope,
+    结果数: items.length,
+    结果: items,
+    ...(warnings.length ? { 警告: warnings } : {}),
+  };
 }

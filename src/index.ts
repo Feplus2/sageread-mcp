@@ -836,6 +836,18 @@ const server = new McpServer({
   version: "0.3.0",
 });
 
+/**
+ * 旧工具开关（默认关闭）：不设置 SAGEREAD_MCP_LEGACY_TOOLS=1 时只注册现代精简集，
+ * 避免新旧工具并列造成 Agent 选择困难；旧工具代码保留，供旧客户端/旧提示词兼容。
+ * legacyTool 关闭时为空操作；断言为 server.tool 的完整重载类型，调用处仍能获得参数类型推导。
+ */
+const LEGACY_TOOLS_ENABLED = process.env.SAGEREAD_MCP_LEGACY_TOOLS === "1";
+const legacyTool = (
+  LEGACY_TOOLS_ENABLED
+    ? (server.tool.bind(server) as unknown as typeof server.tool)
+    : (() => undefined)
+) as unknown as typeof server.tool;
+
 server.tool(
   "list_books",
   "列出 SageRead 书库中的所有书籍（含阅读进度、状态、标签等），默认排除回收站中的书籍",
@@ -1257,7 +1269,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "get_paper_toc",
   "获取论文的目录结构（解析 paper.md 的 Markdown 标题，按层级缩进展示）",
   { paper: z.string().describe("论文标题（模糊）或论文 id") },
@@ -1275,7 +1287,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "read_paper",
   "读取论文正文（paper.md 的字符切片，用 offset/limit 分段阅读长文）",
   {
@@ -1301,7 +1313,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "read_paper_section",
   "按小节标题读取论文的对应章节内容（标题子串匹配，截 30000 字符）",
   {
@@ -1529,7 +1541,7 @@ server.tool(
 
 // ---------- 语义检索 ----------
 
-server.tool(
+legacyTool(
   "semantic_search",
   "对 SageRead 向量库做语义检索（默认论文库；需已配置嵌入模型，未配置时返回降级提示）",
   {
@@ -1573,7 +1585,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "get_chunk_context",
   "按块序号取语义检索命中块的上下文（前后各扩 radius 块拼接，当前块有标记）；论文与书籍均支持",
   {
@@ -1653,7 +1665,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "get_book_toc",
   "获取书籍（EPUB）目录：解析 mdbook 的 nav.md，按层级列出各章标题及正文文件名（供 read_book 使用）",
   { book: z.string().describe("书名（模糊）或 book id") },
@@ -1686,7 +1698,7 @@ server.tool(
   },
 );
 
-server.tool(
+legacyTool(
   "read_book",
   "读取书籍（EPUB）某章正文：直读 mdbook 的 md 文件，用 offset/limit 分段读长章，不受 get_chunk_context 的 3 块上限约束",
   {
@@ -2023,6 +2035,135 @@ server.tool(
             ? "库内未发现引用关系（可能参考文献不在库内，或 DOI/标题未匹配上）"
             : undefined,
     });
+  },
+);
+
+server.tool(
+  "search_library",
+  "统一检索入口：对书库/论文库/跨库做语义检索，返回统一的 doc 锚点（book:<id> / paper:<id>）与片段；可用 doc 限定单本/单篇，命中后接 read_document 精读（需 SageRead 运行且向量模型就绪）",
+  {
+    query: z.string().describe("查询文本（自然语言，将以当前嵌入模型向量化后做近邻检索）"),
+    scope: z.enum(["all", "papers", "books"]).optional().describe("可选：检索范围（all=跨库，papers=论文库，books=书库），默认 all"),
+    doc: z.string().optional().describe("可选：限定单个文档，book:<id> 或 paper:<id>（与 scope 冲突时报错）"),
+    collection: z.string().optional().describe("可选：限定某个收藏文件夹内的论文（文件夹名子串或 id；仅论文域生效）"),
+    top_k: z.number().int().min(1).max(30).optional().describe("可选：返回条数，默认 8，上限 30"),
+  },
+  async ({ query, scope, doc, collection, top_k }) => {
+    let ref: DocRef | undefined;
+    if (doc) {
+      const parsed = parseDocRef(doc);
+      if (!parsed.ref) return fail(parsed.error!);
+      ref = parsed.ref;
+      const row = findBook(ref.id);
+      if (!row) return fail("未找到文档：" + doc);
+      if (ref.kind === "paper" && row.format !== "MARKDOWN") {
+        return fail(`《${row.title}》不是论文（格式为 ${row.format}）：请改用 book:${row.id}`);
+      }
+      if (ref.kind === "book" && row.format === "MARKDOWN") {
+        return fail(`《${row.title}》是论文（MARKDOWN）：请改用 paper:${row.id}`);
+      }
+    }
+    const derivedScope: "all" | "papers" | "books" = ref
+      ? ref.kind === "paper"
+        ? "papers"
+        : "books"
+      : scope ?? "all";
+    if (ref && scope && scope !== "all" && scope !== derivedScope) {
+      return fail(
+        `doc 与 scope 冲突：doc=${ref.kind}:${ref.id} 属于${ref.kind === "paper" ? "论文库" : "书库"}，scope=${scope} 不匹配`,
+      );
+    }
+    if (collection && derivedScope === "books") {
+      return fail("collection 仅适用于论文库（scope=papers/all 或 doc=paper:<id>）");
+    }
+    // 显式限定单个文档且未建向量索引：直接返回可行动的空结果，避免无意义的嵌入调用
+    if (ref) {
+      const status = ref.kind === "paper" ? paperIndexStatus(ref.id) : bookIndexStatus(ref.id);
+      if (!status.indexed) {
+        return ok({
+          查询: query,
+          范围: derivedScope,
+          限定: `${ref.kind}:${ref.id}`,
+          结果数: 0,
+          结果: [],
+          提示: `该${ref.kind === "paper" ? "论文" : "书籍"}未建向量索引：可先用 get_document_info 看目录，再用 read_document 按 ${ref.kind === "paper" ? "heading" : "heading/file"} 精读，或在 SageRead 中向量化后重试`,
+        });
+      }
+    }
+    // collection → 文件夹成员 paper_id 集合（与 semantic_search 的过滤语义保持一致）
+    let paperIds: string[] | undefined;
+    if (collection) {
+      const folder = findFolder(collection);
+      if (!folder) {
+        const names = listFolderNames();
+        return fail(
+          `未找到匹配的文件夹: ${collection}${names.length ? `，可选文件夹：${names.join("、")}` : "（当前没有任何文件夹）"}`,
+        );
+      }
+      paperIds = (
+        db.prepare(`SELECT paper_id FROM paper_folders WHERE folder_id = ?`).all(folder.id) as {
+          paper_id: string;
+        }[]
+      ).map((r) => r.paper_id);
+    }
+    try {
+      const result = await semanticSearch(APP_DIR, {
+        query,
+        scope: derivedScope,
+        paperId: ref?.kind === "paper" ? ref.id : undefined,
+        paperIds,
+        bookId: ref?.kind === "book" ? ref.id : undefined,
+        topK: top_k ?? 8,
+      });
+      // 书库向量目录里可能包含 __app_manual__ / __repo_wiki__ 等非书库文档：
+      // 它们无法被 DocRef 读取，跳过以保证每条结果的 doc 锚点都可直接使用
+      const skippedInternal: string[] = [];
+      const items = result.结果.flatMap((item) => {
+        const id = item.出处.id;
+        if (!id || !db.prepare("SELECT 1 FROM books WHERE id = ?").get(id)) {
+          if (id) skippedInternal.push(id);
+          return [];
+        }
+        const docAnchor = `${item.出处.类型 === "论文" ? "paper" : "book"}:${id}`;
+        return [
+          {
+            rank: item.rank,
+            doc: docAnchor,
+            类型: item.出处.类型,
+            标题: item.出处.书名,
+            作者: item.出处.作者,
+            章节: item.出处.章节,
+            文件: item.出处.文件 ? path.basename(item.出处.文件) : null,
+            块位置: item.出处.块位置,
+            相似度: item.相似度,
+            片段: item.内容,
+            下一步: `read_document(doc='${docAnchor}')`,
+          },
+        ];
+      });
+      const warnings = [
+        ...(result.警告 ?? []),
+        ...(skippedInternal.length
+          ? [`已跳过 ${skippedInternal.length} 条非书库文档的命中（内部手册/知识库等，没有可用的 DocRef）`]
+          : []),
+      ];
+      const hint = items.length
+        ? undefined
+        : "未命中：可换关键词、放宽 scope，或先用 list_books / list_papers 浏览元数据后再读原文";
+      return ok({
+        查询: query,
+        范围: derivedScope,
+        ...(ref ? { 限定: `${ref.kind}:${ref.id}` } : {}),
+        结果数: items.length,
+        结果: items,
+        ...(warnings.length ? { 警告: warnings } : {}),
+        ...(hint ? { 提示: hint } : {}),
+      });
+    } catch (err) {
+      return fail(
+        `检索失败（语义检索需要 SageRead 运行且向量模型就绪）：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   },
 );
 
