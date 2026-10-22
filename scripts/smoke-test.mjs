@@ -114,6 +114,41 @@ show("list_notes（截断）", allNotes.text, 600);
 const papers = await callTool("list_papers", {});
 show("list_papers（默认）", papers.text, 800);
 
+// ---- P1 文档原语（DocRef）对齐 ----
+const firstPaperId = (() => {
+  try {
+    const parsed = JSON.parse(papers.text);
+    return parsed && parsed.论文 && parsed.论文[0] ? parsed.论文[0].id : null;
+  } catch {
+    return null;
+  }
+})();
+if (firstPaperId) {
+  const docInfo = await callTool("get_document_info", { doc: "paper:" + firstPaperId });
+  show("get_document_info(paper)", docInfo.text, 500);
+  assert(!docInfo.isError, "get_document_info(paper) 不应报错");
+  const readDoc = await callTool("read_document", { doc: "paper:" + firstPaperId, limit: 1200 });
+  show("read_document(paper)", readDoc.text, 400);
+  assert(!readDoc.isError, "read_document(paper) 不应报错");
+  const graph = await callTool("get_citation_graph", { doc: "paper:" + firstPaperId }, 30000);
+  show("get_citation_graph(paper)", graph.text, 500);
+  assert(!graph.isError, "get_citation_graph(paper) 不应报错");
+}
+
+const firstBook = (() => {
+  try {
+    const parsed = JSON.parse(booksRes.text);
+    return parsed && parsed[0] ? parsed[0].id : null;
+  } catch {
+    return null;
+  }
+})();
+if (firstBook) {
+  const bookInfo = await callTool("get_document_info", { doc: "book:" + firstBook });
+  show("get_document_info(book)", bookInfo.text, 500);
+  assert(!bookInfo.isError, "get_document_info(book) 不应报错");
+}
+
 // collection 取现存第一个文件夹（固定名会随库演变失效）
 const firstFolder = (() => {
   try {

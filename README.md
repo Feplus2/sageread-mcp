@@ -38,6 +38,9 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 | `get_book_toc` | 书籍（EPUB）目录：解析 mdbook 的 nav.md，按层级列出各章标题及正文文件名 | `book` 书名（模糊）或 id |
 | `read_book` | 读取书籍某章正文（直读 mdbook 的 md 文件，offset/limit 分段；不受 `get_chunk_context` 3 块上限约束） | `book`，`file`（文件名如 part003.md 或章节标题），`offset?`，`limit?`（默认 30000，上限 60000） |
 
+| `get_document_info` | 统一 DocRef 的文档信息：书籍/论文标题、目录、图表与参考文献数、**向量索引状态** | `doc`: `book:<id>` 或 `paper:<id>` |
+| `read_document` | 统一 DocRef 读原文窗口：论文用 heading/offset，书籍用 heading/file + offset；返回文本、总长度与 `next_offset` | `doc`，`heading?`，`file?`，`offset?`，`limit?` |
+| `get_citation_graph` | 库内引用关系：它引用了库里哪些论文 / 库里谁引用了它（按 DOI/标题匹配 References，无需向量索引） | `doc`: `paper:<id>`，`include_cited_by?` |
 论文工具（`get_paper_info` / `get_paper_toc` / `read_paper` / `read_paper_section`）仅支持 MARKDOWN 格式的论文书籍；书籍工具（`get_book_toc` / `read_book`）面向 EPUB 等普通书籍，两者互斥，误用会返回明确的重定向提示。
 
 `export_paper_citation` 的 `format` 支持 8 种格式：

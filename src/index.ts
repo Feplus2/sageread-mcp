@@ -833,7 +833,7 @@ function fail(message: string) {
 
 const server = new McpServer({
   name: "sageread-mcp",
-  version: "0.1.0",
+  version: "0.3.0",
 });
 
 server.tool(
@@ -1719,6 +1719,310 @@ server.tool(
       `《${found.title}》· ${name}（本章共 ${content.length} 字符）\n\n${slice}` +
         (truncated ? `\n\n(已截断，下一 offset=${start + size})` : ""),
     );
+  },
+);
+
+// ---------- P1 文档原语对齐（DocRef：book:<id> / paper:<id>） ----------
+
+interface DocRef {
+  kind: "book" | "paper";
+  id: string;
+}
+
+/** 解析 DocRef：支持 book:<id> / paper:<id>，也兼容直接传书籍 id（按 format 自动判断） */
+function parseDocRef(raw: string): { ref?: DocRef; error?: string } {
+  const value = raw.trim();
+  const match = /^(book|paper):(.+)$/.exec(value);
+  if (match) return { ref: { kind: match[1] as "book" | "paper", id: match[2].trim() } };
+  const row = db.prepare("SELECT id, format FROM books WHERE id = ?").get(value) as
+    | { id: string; format: string }
+    | undefined;
+  if (row) return { ref: { kind: row.format === "MARKDOWN" ? "paper" : "book", id: row.id } };
+  return { error: "无法识别文档引用「" + raw + "」：请用 book:<id> 或 paper:<id>（也可直接传书籍 id）" };
+}
+
+function paperIndexStatus(paperId: string): { indexed: boolean; chunks: number } {
+  const dbFile = path.join(APP_DIR, "papers", "vectors.sqlite");
+  if (!fs.existsSync(dbFile)) return { indexed: false, chunks: 0 };
+  try {
+    const pdb = new Database(dbFile, { readonly: true, fileMustExist: true });
+    const row = pdb.prepare("SELECT COUNT(*) AS n FROM document_chunks WHERE paper_id = ?").get(paperId) as { n: number };
+    pdb.close();
+    return { indexed: row.n > 0, chunks: row.n };
+  } catch {
+    return { indexed: false, chunks: 0 };
+  }
+}
+
+function bookIndexStatus(bookId: string): { indexed: boolean; chunks: number } {
+  const dbFile = path.join(APP_DIR, "books", bookId, "vectors.sqlite");
+  if (!fs.existsSync(dbFile)) return { indexed: false, chunks: 0 };
+  try {
+    const bdb = new Database(dbFile, { readonly: true, fileMustExist: true });
+    const row = bdb.prepare("SELECT COUNT(*) AS n FROM document_chunks").get() as { n: number };
+    bdb.close();
+    return { indexed: row.n > 0, chunks: row.n };
+  } catch {
+    return { indexed: false, chunks: 0 };
+  }
+}
+
+function bookTocEntries(bookId: string): { entries: BookTocEntry[]; source: string } {
+  const oebps = findBookOebpsDir(bookId);
+  if (!oebps) return { entries: [], source: "none" };
+  const nav = parseNavToc(oebps);
+  if (nav.length) return { entries: nav, source: "nav.md" };
+  return {
+    entries: listBookTextFiles(oebps).map((file) => ({
+      level: 1,
+      title: path.basename(file, ".md"),
+      file: path.basename(file),
+      filePath: file,
+    })),
+    source: "text-files",
+  };
+}
+
+function extractPaperSection(content: string, heading: string): { text?: string; headingText?: string; error?: string } {
+  const headings = parsePaperHeadings(content);
+  const needle = heading.toLowerCase();
+  const target = headings.find((h) => h.text.toLowerCase().includes(needle));
+  if (!target) {
+    const available = headings.length
+      ? headings.map((h) => "  ".repeat(h.level - 1) + "- " + h.text).join("\n")
+      : "（本文没有任何 Markdown 标题）";
+    return { error: "未找到匹配标题「" + heading + "」的小节，可选标题：\n" + available };
+  }
+  const next = headings.find((h) => h.charStart > target.charStart && h.level <= target.level);
+  return {
+    text: content.slice(target.charStart, next ? next.charStart : content.length),
+    headingText: target.text,
+  };
+}
+
+function referenceEntries(content: string): string[] {
+  const headings = parsePaperHeadings(content);
+  const start = headings.find((h) => /^(references|参考文献)/i.test(h.text.trim()));
+  if (!start) return [];
+  const next = headings.find((h) => h.charStart > start.charStart && h.level <= start.level);
+  const block = content.slice(start.charStart, next ? next.charStart : content.length);
+  const entries: string[] = [];
+  let current: string[] = [];
+  const flush = () => {
+    const value = current.join(" ").trim();
+    if (value) entries.push(value);
+    current = [];
+  };
+  for (const line of block.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flush();
+      continue;
+    }
+    if (/^(\[\d+\]|\d+[.)])\s+/.test(trimmed)) flush();
+    current.push(trimmed);
+  }
+  flush();
+  return entries;
+}
+
+function normalizeMatchKey(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function citationEntryMatches(entry: string, doi: string, title: string): boolean {
+  const doiKey = doi.trim().toLowerCase();
+  if (doiKey.length > 6 && entry.toLowerCase().includes(doiKey)) return true;
+  const titleKey = normalizeMatchKey(title);
+  return titleKey.length >= 18 && normalizeMatchKey(entry).includes(titleKey.slice(0, 60));
+}
+
+server.tool(
+  "get_document_info",
+  "获取文档信息与目录（统一 DocRef）：传 book:<id> 或 paper:<id>，返回标题/元数据、目录、图表/引用计数与向量索引状态（未索引时只能按原文读取）",
+  { doc: z.string().describe("文档引用：book:<id> 或 paper:<id>（也可直接传书籍 id）") },
+  async ({ doc }) => {
+    const parsed = parseDocRef(doc);
+    if (!parsed.ref) return fail(parsed.error!);
+    const ref = parsed.ref;
+    const row = findBook(ref.id);
+    if (!row) return fail("未找到文档：" + doc);
+    if (ref.kind === "paper") {
+      const { content, error } = readPaperMd(ref.id);
+      if (content === undefined) return fail(error!);
+      const fm = parsePaperFrontmatter(content);
+      const metaZh = readPaperMetaJson(ref.id);
+      const headings = parsePaperHeadings(content);
+      return ok({
+        doc: "paper:" + ref.id,
+        类型: "论文（MARKDOWN）",
+        标题: fmStr(fm.title) ?? row.title,
+        作者: normalizeAuthors(fm.author).join(", ") || row.author || null,
+        期刊: fmStr(fm["container-title"]),
+        日期: fmStr(fm.date),
+        DOI: fmStr(fm.doi),
+        中文标题: metaZh.title_zh ?? null,
+        索引: paperIndexStatus(ref.id),
+        目录条数: headings.length,
+        目录: headings.slice(0, 80).map((h) => ({ level: h.level, heading: h.text })),
+        图表数: (content.match(/^!\[/gm) || []).length,
+        参考文献数: referenceEntries(content).length,
+      });
+    }
+    const toc = bookTocEntries(ref.id);
+    return ok({
+      doc: "book:" + ref.id,
+      类型: "书籍（" + row.format + "）",
+      标题: row.title,
+      作者: row.author || null,
+      索引: bookIndexStatus(ref.id),
+      目录条数: toc.entries.length,
+      目录来源: toc.source,
+      目录: toc.entries.slice(0, 80).map((entry) => ({ level: entry.level, heading: entry.title, file: entry.file ?? null })),
+    });
+  },
+);
+
+server.tool(
+  "read_document",
+  "读取文档原文窗口（统一 DocRef）：paper 用 heading 或 offset；book 用 heading 或 file + offset；返回文本、总长度与 next_offset，未索引文档会附索引状态提示",
+  {
+    doc: z.string().describe("文档引用：book:<id> 或 paper:<id>"),
+    heading: z.string().optional().describe("可选：章节/小节标题（子串匹配）"),
+    file: z.string().optional().describe("可选（仅书籍）：章节文件名（如 part003.md）或章节标题"),
+    offset: z.number().int().min(0).optional().describe("可选：起始字符位置，默认 0"),
+    limit: z.number().int().min(1).max(30000).optional().describe("可选：读取字符数，默认 6000，上限 30000"),
+  },
+  async ({ doc, heading, file, offset, limit }) => {
+    const parsed = parseDocRef(doc);
+    if (!parsed.ref) return fail(parsed.error!);
+    const ref = parsed.ref;
+    const row = findBook(ref.id);
+    if (!row) return fail("未找到文档：" + doc);
+    const size = limit ?? 6000;
+    if (ref.kind === "paper") {
+      const { content, error } = readPaperMd(ref.id);
+      if (content === undefined) return fail(error!);
+      let text: string;
+      let start = offset ?? 0;
+      if (heading) {
+        const section = extractPaperSection(content, heading);
+        if (section.text === undefined) return fail(section.error!);
+        text = section.text;
+        start = Math.max(0, content.indexOf(section.text));
+      } else {
+        if (start >= content.length) return fail("offset " + start + " 超出全文长度（共 " + content.length + " 字符）");
+        text = content.slice(start, start + size);
+      }
+      const shown = text.slice(0, size);
+      const nextOffset = start + shown.length;
+      const status = paperIndexStatus(ref.id);
+      return ok({
+        doc: "paper:" + ref.id,
+        标题: row.title,
+        索引: status,
+        总字符数: content.length,
+        读取起点: start,
+        文本: shown,
+        next_offset: nextOffset < content.length ? nextOffset : null,
+        提示: status.indexed ? "已建向量索引，也可先用 semantic_search 定位" : "本篇未建向量索引：只能按原文读取（较慢），可在 SageRead 设置中向量化提速",
+      });
+    }
+    const oebps = findBookOebpsDir(ref.id);
+    if (!oebps) return fail("未找到《" + row.title + "》的 mdbook 目录：该书可能尚未完成 EPUB→mdbook 转换");
+    const target = heading ?? file;
+    if (!target) return fail("读书籍需要 heading 或 file（见 get_document_info 的目录）");
+    const resolved = resolveBookFile(oebps, target);
+    if (resolved.ambiguous) return fail("「" + target + "」匹配到多个章节，请传文件名（如 part003.md）");
+    if (!resolved.filePath) return fail(resolved.error ?? "未找到与「" + target + "」匹配的章节");
+    const content = fs.readFileSync(resolved.filePath, "utf8");
+    const start = offset ?? 0;
+    if (start >= content.length) return fail("offset " + start + " 超出本章长度（共 " + content.length + " 字符）");
+    const shown = content.slice(start, start + size);
+    const nextOffset = start + shown.length;
+    const status = bookIndexStatus(ref.id);
+    return ok({
+      doc: "book:" + ref.id,
+      标题: row.title,
+      章节: path.basename(resolved.filePath),
+      索引: status,
+      本章字符数: content.length,
+      读取起点: start,
+      文本: shown,
+      next_offset: nextOffset < content.length ? nextOffset : null,
+      提示: status.indexed ? "本书已建向量索引" : "本书未建向量索引：按原文读取较慢，可在 SageRead 设置中向量化提速",
+    });
+  },
+);
+
+server.tool(
+  "get_citation_graph",
+  "查看论文在库内的引用关系：它引用了库里哪些论文 / 库里哪些论文引用了它（按 DOI/标题匹配 References，不需要向量索引）",
+  {
+    doc: z.string().describe("目标论文：paper:<id>（也可直接传论文 id）"),
+    include_cited_by: z.boolean().optional().describe("可选：是否扫描库内其它论文的 References 找「谁引用了它」，默认 true"),
+  },
+  async ({ doc, include_cited_by }) => {
+    const parsed = parseDocRef(doc);
+    if (!parsed.ref) return fail(parsed.error!);
+    if (parsed.ref.kind !== "paper") return fail("引用图谱目前只支持论文（paper:<id>）");
+    const target = findBook(parsed.ref.id);
+    if (!target) return fail("未找到论文：" + doc);
+    const { content, error } = readPaperMd(parsed.ref.id);
+    if (content === undefined) return fail(error!);
+    const fm = parsePaperFrontmatter(content);
+    const targetDoi = fmStr(fm.doi) ?? "";
+    const targetTitle = fmStr(fm.title) ?? target.title;
+    const library = db
+      .prepare("SELECT id, title FROM books WHERE format = 'MARKDOWN' AND trashed_at IS NULL")
+      .all() as { id: string; title: string }[];
+    const identities = library
+      .filter((row) => row.id !== parsed.ref!.id)
+      .map((row) => {
+        const md = readPaperMd(row.id);
+        const otherFm = md.content ? parsePaperFrontmatter(md.content) : {};
+        return { id: row.id, title: fmStr(otherFm.title) ?? row.title, doi: fmStr(otherFm.doi) ?? "", content: md.content ?? "" };
+      });
+    const referencesInLibrary: { ref_index: number; paper: string; title: string; entry: string }[] = [];
+    referenceEntries(content).forEach((entry, index) => {
+      for (const other of identities) {
+        if (citationEntryMatches(entry, other.doi, other.title)) {
+          referencesInLibrary.push({ ref_index: index + 1, paper: "paper:" + other.id, title: other.title, entry: entry.slice(0, 180) });
+        }
+      }
+    });
+    const citedBy: { paper: string; title: string; ref_indexes: number[]; entries: string[] }[] = [];
+    if (include_cited_by !== false) {
+      for (const other of identities) {
+        const indexes: number[] = [];
+        const entries: string[] = [];
+        referenceEntries(other.content).forEach((entry, index) => {
+          if (citationEntryMatches(entry, targetDoi, targetTitle)) {
+            indexes.push(index + 1);
+            if (entries.length < 3) entries.push(entry.slice(0, 180));
+          }
+        });
+        if (indexes.length) citedBy.push({ paper: "paper:" + other.id, title: other.title, ref_indexes: indexes, entries });
+      }
+    }
+    return ok({
+      doc: "paper:" + parsed.ref.id,
+      标题: targetTitle,
+      DOI: targetDoi || null,
+      引用了库内: referencesInLibrary,
+      被库内引用: citedBy,
+      说明:
+        identities.length === 0
+          ? "文献库里没有其它论文，无法建立引用关系"
+          : referencesInLibrary.length === 0 && citedBy.length === 0
+            ? "库内未发现引用关系（可能参考文献不在库内，或 DOI/标题未匹配上）"
+            : undefined,
+    });
   },
 );
 
