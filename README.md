@@ -4,12 +4,12 @@
 
 Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sageread) 发展的独立维护版；本 MCP 同时兼容两者的数据目录（优先读 Better SageRead，见「数据目录」一节）。
 
-- **数据安全**：以 `readonly` 模式打开 SageRead 的 SQLite 数据库，不会以任何形式写入，不影响 SageRead 运行
+- **数据安全**：以 `readonly` 模式打开 SageRead 的 SQLite 数据库，不写入数据库；BM25 统计也实时只读计算，不写 `bm25_stats`
 - **密钥不出 app**：语义检索的嵌入调用经 SageRead 本地通道转发，本进程不读取/不持有任何 API Key
-- **SageRead 不在运行时只读工具可用**（数据是本地文件）；`search_library` 需应用运行（嵌入在 app 内执行）
-- **论文支持**：读取论文元数据、目录、正文与分组，列出论文标注（含星标/类别/来源），导出 8 种引用格式
-- **书籍直读**：`get_document_info` / `read_document` 解析 EPUB 的 mdbook 目录并直读整章正文（不再只能靠 3 块上下文拼接）
-- **语义检索**：`search_library` 基于 SageRead 的向量库（sqlite-vec）对书库/论文库/跨库做统一近邻检索
+- **离线可用**：应用不在运行时仍能读 SQLite、`paper.md` 与 EPUB；`search_library` 自动按标题/关键词回退，未索引文档也能搜索
+- **论文支持**：完整 JSON/frontmatter 字段级元数据回退、canonical 目录与连续正文窗口、分组、标注和 8 种引用格式
+- **书籍直读**：Node 直接解析 EPUB 的 OPF/spine/nav，保留公式、表格和图片；无 EPUB 时回退 mdbook 原文
+- **混合检索**：`search_library` 合并 sqlite-vec、BM25 与关键词/标题结果，命中带可重放 `read` 锚点和有界 `next_cursor`
 - **跨应用联动**：配合其他 MCP（如知识库类），可以让 Agent 完成"把某段阅读对话归档到知识库"这类操作
 
 ## 工具（tools）
@@ -34,12 +34,20 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 | `list_papers` | 批量文献卡片（书目信息一览，供初筛） | `collection?`，`include_abstract?`，`limit?`（默认 50，上限 200） |
 | `list_paper_folders` | 论文分组（文件夹/颜色/包含论文） | 无 |
 | `export_paper_citation` | 导出参考文献引用（8 种格式，见下），单篇或整个收藏文件夹 | `paper?`，`collection?`（两者至少给一个），`format?`（默认 bibtex） |
-| `search_library` | **统一检索**：书库/论文库/跨库语义检索，每条结果带统一 `doc` 锚点与片段 | `query`，`scope?`（all/papers/books，默认 all），`doc?`（`book:<id>` / `paper:<id>`），`collection?`（仅论文），`top_k?`（默认 8，上限 30） |
-| `get_document_info` | 统一 DocRef 的文档信息：书籍/论文标题、目录、图表与参考文献数、**向量索引状态** | `doc`: `book:<id>` 或 `paper:<id>` |
-| `read_document` | 统一 DocRef 读原文窗口：论文用 heading/offset，书籍用 heading/file + offset；返回文本、总长度与 `next_offset` | `doc`，`heading?`，`file?`，`offset?`，`limit?`（默认 6000，上限 30000） |
+| `search_library` | **统一检索**：语义 + BM25 + 关键词/标题互补，命中带 `read` 与续页游标 | `query`，`scope?`（all/papers/books，默认 all），`doc?`，`collection?`，`top_k?`（默认 6，上限 30），`vector_weight?`（0.7），`bm25_weight?`（0.3），`include_references?`（false），`cursor?` |
+| `get_document_info` | 统一 DocRef 的完整元数据、目录、图表与参考文献数、索引状态；损坏元数据返回 `partial/errors` | `doc`: `book:<id>` 或 `paper:<id>` |
+| `read_document` | 统一 DocRef 读 canonical 窗口；返回 `read/range/text/next_offset` | `doc`，`heading?`，`file?`，`spine?`，`fragment?`，`offset?`，`before?`（上限 8000），`after?` / `limit?`（默认 6000，上限 30000） |
 | `get_citation_graph` | 库内引用关系：它引用了库里哪些论文 / 库里谁引用了它（按 DOI/标题匹配 References，无需向量索引） | `doc`: `paper:<id>`，`include_cited_by?` |
 
 论文与书籍统一用 `doc` 锚点表达：论文 `paper:<id>`、书籍 `book:<id>`；`get_document_info` 返回目录，`read_document` 按目录读正文，`search_library` 的命中结果同样带 `doc` 锚点。论文工具只支持 MARKDOWN 格式的论文书籍，`book:<id>` 指向论文或 `paper:<id>` 指向普通书籍时，DocRef 工具会返回明确的重定向提示。
+
+### 文档坐标、元数据与图片缓存
+
+- 所有现代 offset 都是 JavaScript UTF-16 字符坐标，`range` 为半开区间 `[start,end)`。`read` 可原样回传；续读把上次 `next_offset` 放进 `offset`，不要自行加减。
+- **论文**：canonical 去除 frontmatter、统一 CRLF/CR 为 LF 并规范化 display math。`heading` 首窗从该节 `contentStart` 开始，后续 `next_offset` 始终是正文绝对坐标，并限制在该节边界；无 `heading` 时 `offset` 也是正文绝对坐标。`before/after` 可围绕命中扩窗。
+- **书籍**：`heading/file/spine/fragment + offset` 使用节内 canonical；`fragment` 区分同一 XHTML 的多个 nav 锚点。无这些锚点时的显式 `offset` 使用全书 canonical，可按 spine 连续跨章读取。各节以 `\n\n` 拼接，公式、表格、图片 `src/alt` 保留。图片路径在切片之后解析，不改变 offset。全书 canonical 上限为 16M 字符，超过时请按章节读取。
+- **元数据**：`metadata.json` 按字段优先，`paper.md` frontmatter 补齐缺失字段；不存在 JSON 不是错误，损坏或不可读 JSON 会进入 `partial/errors`，不会静默覆盖可用 frontmatter。
+- **图片缓存**：仅当返回窗口内的 EPUB 图片在 mdbook 中缺盘时，才物化该图片到 `{appDir}/image-cache/epub/<bookId>/<sha256>.<ext>`。路径由书籍与解析后的资源 href 决定，同书同资源复用；不整书预提取。响应的 `图片缓存` 披露目录与用途。
 
 ### 旧工具（legacy，默认关闭，7 个）
 
@@ -55,7 +63,7 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 | `read_book` | 读取书籍某章正文（file + offset/limit） | `read_document`（`file` + `offset`） |
 | `get_chunk_context` | 语义检索命中块前后各扩 radius 块 | `read_document`（按 `heading`/`offset` 精读；legacy 下仍可精确取块上下文） |
 
-旧工具代码与行为全部保留，只是默认不出现在 `tools/list` 中；开关在进程启动时读取，切换后需重启 MCP 客户端。
+旧工具代码与行为全部保留，只是默认不出现在 `tools/list` 中；开关在进程启动时读取，切换后需重启 MCP 客户端。Legacy `read_paper/read_book` 仍用原始 `paper.md` / mdbook Markdown offset，与现代 canonical 坐标不互换；legacy `semantic_search` 仍默认 8 条、只走向量通道并保留旧输出，不获得现代关键词回退、混合权重或游标。
 
 ### 工具面迁移与 legacy 开关
 
@@ -99,28 +107,34 @@ Better SageRead 是基于上游 [xincmm/sageread](https://github.com/xincmm/sage
 
 Title Case 转换（mla/chicago）做了保守处理：化学式/公式/含数字或内部大写的词（Na-ion、P2-type、$x$ 等）原样保留。
 
-## 语义检索说明
+## 检索、回退与续页
 
-`search_library`（legacy 下还有 `semantic_search`）需要：① SageRead 应用正在运行（启动时会写 `mcp-local.json` 本地通道凭据）；
-② 已在「设置 → 向量模型」配置并选中向量模型；③ 对论文/书籍执行过向量化。
+`search_library` 默认 `scope=all`，也可选 `papers/books`；`doc=paper:<id>/book:<id>` 限定单篇/单本，`collection` 过滤论文收藏。`doc` 与 `scope` 冲突、DocRef 类型错误或 cursor 用在 `doc` 模式都会明确报错。
 
-查询文本的向量化由 **SageRead 应用内执行**（用当前选中模型与 keyring 密钥），sageread-mcp 只发文本、只收回向量——**API Key 绝不进入本进程**。未启动应用/未配置模型时，工具返回带引导的降级提示而非崩溃。
+真实嵌入通道可用时，查询文本由 **SageRead 应用内执行向量化**（当前模型与 keyring 密钥），本进程只发文本、只收回向量，API Key 不进入 MCP。应用未运行、未配置模型或设置 `SAGEREAD_DISABLE_EMBED=1` 时，不会让整个检索失败：标题/关键词通道仍返回结果，并在 `errors/警告` 与 `partial` 中披露 indexed 通道不可用。Legacy `semantic_search` 不受这个离线开关以外的回退影响，仍要求嵌入通道。
 
-- `search_library` 默认 `scope=all`（跨库）；`scope=papers/books` 只查单域；`doc=paper:<id>/book:<id>` 限定单篇/单本
-- 返回每条结果的 `doc` 是统一锚点（`paper:<id>` / `book:<id>`），`片段` 是命中块内容，`下一步` 给出可直接执行的 `read_document` 调用；空结果会附 `提示`（未向量化 / 换关键词）
-- `collection` 按收藏文件夹过滤论文（仅影响论文域）；显式 `doc` 与 `scope` 冲突、或指向错误类型（论文用 `book:`）时会立即报错，不会静默返回空
-- 跨库检索时**空/损坏的单个向量库会被跳过**并在结果 `警告` 中列出，不会拖垮其它库；只返回能在 `books` 表解析为 DocRef 的文档，内部手册/知识库等向量目录的命中会跳过并计数
-- 查询向量维度与向量索引维度不一致时，会提示在 SageRead 中重建向量索引
-- **相似度数值偏低不代表没命中**：返回的「相似度」是向量距离换算值，受嵌入模型与文本长度影响很大，实测有 17% 相似度却内容完全正确的命中。**不要按相似度阈值过滤结果**，应逐条看内容与出处判断相关性
+- **参数**：`top_k` 默认 6、最大 30（直接调用也强制截断）；`vector_weight=0.7`、`bm25_weight=0.3` 会归一化并参与实际评分和跨书排序；`include_references=false` 默认排除 References/参考文献。旧向量库缺少 `is_references` 列时会明确警告，不会直接 SQL 失败。
+- **命中**：每条同时保留中文字段并提供 `doc/snippet/similarity/source/index/read/anchor_precision`。`source` 为 `hybrid/bm25/keyword/title`；`index` 区分 `indexed/not_indexed`；只有经验证的唯一 canonical 位置才是 `exact` 并带 offset，重复或无法验证时降级为 `section`，不伪造位置。`hit.read` 可直接传给 `read_document`，再叠加 `before/after`。
+- **无向量回退**：`doc` 模式完整扫描单文档；library/all 完整发现标题，并对未索引正文做有界并发、章节数、时间和结果数限制，不无界解压全库 EPUB。`partial/truncated`、回退统计和提取错误会如实返回，indexed 通道失败不会抹掉关键词成功结果。
+- **续页**：library/all 返回确定性的无状态 `next_cursor`，继续时原样回传 `cursor`。游标绑定 `query/scope/collection/include_references`，错误组合会拒绝；`doc` 模式不使用 cursor。merge/RRF 只记录实际发出的 section-aware 命中，被首页挤掉的 fallback 可在后续页补发，直到游标消失；首页与续页都保留 `partial/truncated`。
+- **只读与降级**：损坏或维度不匹配的单个向量库会进入 `errors/警告`，不拖垮其它库；内部手册等无法解析为 DocRef 的命中会跳过。BM25 实时计算，不写统计缓存。
+- **不要机械按分数过滤**：现代分数混合向量、BM25 与关键词/标题通道，legacy 分数来自向量距离；语义分数低也可能是正确内容，应结合片段与出处判断。
 
 ## 安装与构建
 
 ```bash
 npm install
-npm run build        # 产物在 dist/
-npm run smoke        # 冒烟测试：默认集 18 个 + legacy 开关 25 个（连真实开发版数据库）
-SAGEREAD_SMOKE_EMBED=1 npm run smoke   # 追加 search_library 的真实嵌入调用（需 SageRead 运行）
+npm run clean && npm run build
+node scripts/test-document-contract.mjs   # canonical、元数据、连续窗口、结构/图片
+node scripts/test-search-library.mjs      # 命中扩窗、回退、参数、merge/RRF 与游标
+npm run smoke                             # 开发库；默认 18 / legacy 25，并强制验证无向量回退
+SAGEREAD_SMOKE_EMBED=1 npm run smoke      # 开发库真实嵌入，必须出现 hybrid 命中
+npm run smoke -- --release                # 发行版库 + 无向量回退
+SAGEREAD_SMOKE_EMBED=1 npm run smoke -- --release  # 发行版库真实嵌入
+npm pack --dry-run                        # 检查实际发布文件
 ```
+
+`npm run smoke` 默认用 `SAGEREAD_DISABLE_EMBED=1` 验证无向量路径；`SAGEREAD_SMOKE_EMBED=1` 才启用并要求真实 hybrid 命中，避免把关键词成功误当成向量成功。真实嵌入不可用时应视为对应验收未通过，不能用降级结果代替。
 
 要求 Node.js >= 18；目前仅支持 Windows（数据目录路径按 `%APPDATA%` 解析）。
 

@@ -13,6 +13,15 @@ import path from "node:path";
 import fs from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { semanticSearch } from "./semantic-search.js";
+import { searchLibrary } from "./search-library.js";
+import {
+  normalizeAuthors,
+  normalizeKeywords,
+  parsePaperCanonical,
+  readPaperDocMetadata,
+  readPaperWindow,
+} from "./paper-document.js";
+import { readBookToc, readBookWindow, resolveBookWindowImages } from "./book-document.js";
 
 // ---------- 数据路径解析 ----------
 
@@ -360,28 +369,6 @@ function resolveBookFile(
     if (tier.length > 1) return { ambiguous: tier };
   }
   return { error: `未找到与「${ref}」匹配的文件名或章节标题` };
-}
-
-/** frontmatter 作者字段归一化为字符串数组（支持 "name" 或 {name: "..."} 两种形态） */
-function normalizeAuthors(raw: unknown): string[] {
-  if (typeof raw === "string") return [raw];
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map((a) => {
-      if (typeof a === "string") return a;
-      if (a !== null && typeof a === "object" && typeof (a as { name?: unknown }).name === "string") {
-        return (a as { name: string }).name;
-      }
-      return "";
-    })
-    .filter(Boolean);
-}
-
-/** 关键词字段归一化为字符串数组（支持数组或逗号分隔字符串） */
-function normalizeKeywords(raw: unknown): string[] {
-  if (typeof raw === "string") return raw.split(",").map((k) => k.trim()).filter(Boolean);
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((k): k is string => typeof k === "string");
 }
 
 /** 论文所属文件夹名称列表（paper_folders JOIN folders） */
@@ -1779,45 +1766,14 @@ function bookIndexStatus(bookId: string): { indexed: boolean; chunks: number } {
   }
 }
 
-function bookTocEntries(bookId: string): { entries: BookTocEntry[]; source: string } {
-  const oebps = findBookOebpsDir(bookId);
-  if (!oebps) return { entries: [], source: "none" };
-  const nav = parseNavToc(oebps);
-  if (nav.length) return { entries: nav, source: "nav.md" };
-  return {
-    entries: listBookTextFiles(oebps).map((file) => ({
-      level: 1,
-      title: path.basename(file, ".md"),
-      file: path.basename(file),
-      filePath: file,
-    })),
-    source: "text-files",
-  };
-}
-
-function extractPaperSection(content: string, heading: string): { text?: string; headingText?: string; error?: string } {
-  const headings = parsePaperHeadings(content);
-  const needle = heading.toLowerCase();
-  const target = headings.find((h) => h.text.toLowerCase().includes(needle));
-  if (!target) {
-    const available = headings.length
-      ? headings.map((h) => "  ".repeat(h.level - 1) + "- " + h.text).join("\n")
-      : "（本文没有任何 Markdown 标题）";
-    return { error: "未找到匹配标题「" + heading + "」的小节，可选标题：\n" + available };
-  }
-  const next = headings.find((h) => h.charStart > target.charStart && h.level <= target.level);
-  return {
-    text: content.slice(target.charStart, next ? next.charStart : content.length),
-    headingText: target.text,
-  };
-}
-
 function referenceEntries(content: string): string[] {
   const headings = parsePaperHeadings(content);
   const start = headings.find((h) => /^(references|参考文献)/i.test(h.text.trim()));
   if (!start) return [];
   const next = headings.find((h) => h.charStart > start.charStart && h.level <= start.level);
-  const block = content.slice(start.charStart, next ? next.charStart : content.length);
+  const headingEnd = content.indexOf("\n", start.charStart);
+  const contentStart = headingEnd < 0 ? content.length : headingEnd + 1;
+  const block = content.slice(contentStart, next ? next.charStart : content.length);
   const entries: string[] = [];
   let current: string[] = [];
   const flush = () => {
@@ -1856,7 +1812,7 @@ function citationEntryMatches(entry: string, doi: string, title: string): boolea
 
 server.tool(
   "get_document_info",
-  "获取文档信息与目录（统一 DocRef）：传 book:<id> 或 paper:<id>，返回标题/元数据、目录、图表/引用计数与向量索引状态（未索引时只能按原文读取）",
+  "获取文档信息与目录（统一 DocRef）：传 book:<id> 或 paper:<id>，返回完整元数据、目录、图表/引用计数与向量索引状态；未索引也可用 search_library 关键词/标题互补检索",
   { doc: z.string().describe("文档引用：book:<id> 或 paper:<id>（也可直接传书籍 id）") },
   async ({ doc }) => {
     const parsed = parseDocRef(doc);
@@ -1867,108 +1823,168 @@ server.tool(
     if (ref.kind === "paper") {
       const { content, error } = readPaperMd(ref.id);
       if (content === undefined) return fail(error!);
-      const fm = parsePaperFrontmatter(content);
-      const metaZh = readPaperMetaJson(ref.id);
-      const headings = parsePaperHeadings(content);
+      const canonical = parsePaperCanonical(content);
+      const metadata = readPaperDocMetadata(path.join(APP_DIR, "books", ref.id), content);
       return ok({
         doc: "paper:" + ref.id,
         类型: "论文（MARKDOWN）",
-        标题: fmStr(fm.title) ?? row.title,
-        作者: normalizeAuthors(fm.author).join(", ") || row.author || null,
-        期刊: fmStr(fm["container-title"]),
-        日期: fmStr(fm.date),
-        DOI: fmStr(fm.doi),
-        中文标题: metaZh.title_zh ?? null,
+        标题: metadata.title ?? row.title,
+        作者: metadata.authors.join(", ") || row.author || null,
+        期刊: metadata.venue ?? null,
+        日期: metadata.date ?? null,
+        DOI: metadata.doi ?? null,
+        关键词: metadata.keywords.length ? metadata.keywords : null,
+        摘要: metadata.abstract ?? null,
+        中文标题: metadata.title_zh ?? null,
+        中文摘要: metadata.abstract_zh ?? null,
+        metadata: {
+          title: metadata.title ?? null,
+          authors: metadata.authors,
+          date: metadata.date ?? null,
+          published: metadata.published ?? null,
+          abstract: metadata.abstract ?? null,
+          keywords: metadata.keywords,
+          volume: metadata.volume ?? null,
+          issue: metadata.issue ?? null,
+          page: metadata.page ?? null,
+          language: metadata.language ?? null,
+          doi: metadata.doi ?? null,
+          venue: metadata.venue ?? null,
+        },
+        partial: metadata.partial,
+        errors: metadata.errors,
         索引: paperIndexStatus(ref.id),
-        目录条数: headings.length,
-        目录: headings.slice(0, 80).map((h) => ({ level: h.level, heading: h.text })),
-        图表数: (content.match(/^!\[/gm) || []).length,
-        参考文献数: referenceEntries(content).length,
+        目录条数: canonical.headings.length,
+        目录: canonical.headings.slice(0, 80).map((heading) => ({
+          id: heading.id,
+          level: heading.level,
+          heading: heading.text,
+          offset: heading.contentStart,
+        })),
+        图表数: (canonical.body.match(/^!\[/gm) || []).length,
+        参考文献数: referenceEntries(canonical.body).length,
       });
     }
-    const toc = bookTocEntries(ref.id);
-    return ok({
-      doc: "book:" + ref.id,
-      类型: "书籍（" + row.format + "）",
-      标题: row.title,
-      作者: row.author || null,
-      索引: bookIndexStatus(ref.id),
-      目录条数: toc.entries.length,
-      目录来源: toc.source,
-      目录: toc.entries.slice(0, 80).map((entry) => ({ level: entry.level, heading: entry.title, file: entry.file ?? null })),
-    });
+    try {
+      const toc = await readBookToc(path.join(APP_DIR, "books", ref.id));
+      return ok({
+        doc: "book:" + ref.id,
+        类型: "书籍（" + row.format + "）",
+        标题: row.title,
+        作者: row.author || null,
+        索引: bookIndexStatus(ref.id),
+        目录条数: toc.entries.length,
+        目录来源: toc.source,
+        目录: toc.entries.slice(0, 80),
+      });
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
   },
 );
 
 server.tool(
   "read_document",
-  "读取文档原文窗口（统一 DocRef）：paper 用 heading 或 offset；book 用 heading 或 file + offset；返回文本、总长度与 next_offset，未索引文档会附索引状态提示",
+  "读取文档 canonical 原文窗口（统一 DocRef）：paper 用 heading 或正文绝对 offset；book 用 heading/file + 节内 offset，或全书绝对 offset；返回可重放 read、range、文本与 next_offset",
   {
     doc: z.string().describe("文档引用：book:<id> 或 paper:<id>"),
     heading: z.string().optional().describe("可选：章节/小节标题（子串匹配）"),
     file: z.string().optional().describe("可选（仅书籍）：章节文件名（如 part003.md）或章节标题"),
-    offset: z.number().int().min(0).optional().describe("可选：起始字符位置，默认 0"),
+    spine: z.number().int().min(0).optional().describe("可选（仅书籍）：EPUB spine 索引；与 offset 组合时为节内坐标"),
+    fragment: z.string().optional().describe("可选（仅书籍）：同一 XHTML 内的 nav fragment/id；与 spine 组合定位精确文本"),
+    offset: z.number().int().min(0).optional().describe("可选：canonical 起始字符位置；续读时原样传上次 next_offset"),
     limit: z.number().int().min(1).max(30000).optional().describe("可选：读取字符数，默认 6000，上限 30000"),
+    before: z.number().int().min(0).max(8000).optional().describe("可选：offset 前保留的字符数，默认 0，上限 8000"),
+    after: z.number().int().min(1).max(30000).optional().describe("可选：offset 后读取的字符数；优先于 limit，默认 6000"),
   },
-  async ({ doc, heading, file, offset, limit }) => {
+  async ({ doc, heading, file, spine, fragment, offset, limit, before, after }) => {
     const parsed = parseDocRef(doc);
     if (!parsed.ref) return fail(parsed.error!);
     const ref = parsed.ref;
     const row = findBook(ref.id);
     if (!row) return fail("未找到文档：" + doc);
-    const size = limit ?? 6000;
+    const size = after ?? limit ?? 6000;
     if (ref.kind === "paper") {
       const { content, error } = readPaperMd(ref.id);
       if (content === undefined) return fail(error!);
-      let text: string;
-      let start = offset ?? 0;
-      if (heading) {
-        const section = extractPaperSection(content, heading);
-        if (section.text === undefined) return fail(section.error!);
-        text = section.text;
-        start = Math.max(0, content.indexOf(section.text));
-      } else {
-        if (start >= content.length) return fail("offset " + start + " 超出全文长度（共 " + content.length + " 字符）");
-        text = content.slice(start, start + size);
+      try {
+        const window = readPaperWindow(content, { heading, offset, before, after: size });
+        const status = paperIndexStatus(ref.id);
+        const replay = {
+          doc: "paper:" + ref.id,
+          ...(heading ? { heading } : {}),
+          ...(offset != null ? { offset } : {}),
+          before: before ?? 0,
+          after: size,
+        };
+        return ok({
+          doc: "paper:" + ref.id,
+          标题: row.title,
+          索引: status,
+          index: { status: status.indexed ? "indexed" : "not_indexed" },
+          anchor: window.anchor,
+          range: { start: window.start, end: window.end, unit: "char" },
+          read: replay,
+          text: window.text,
+          total_chars: window.totalChars,
+          truncated: window.truncated,
+          总字符数: window.totalChars,
+          读取起点: window.start,
+          文本: window.text,
+          next_offset: window.nextOffset,
+          提示: status.indexed ? "已建向量索引，也可先用 search_library 定位" : "本篇未建向量索引：本次按 canonical 原文读取，可在 SageRead 设置中向量化提速",
+        });
+      } catch (error) {
+        return fail(error instanceof Error ? error.message : String(error));
       }
-      const shown = text.slice(0, size);
-      const nextOffset = start + shown.length;
-      const status = paperIndexStatus(ref.id);
-      return ok({
-        doc: "paper:" + ref.id,
-        标题: row.title,
-        索引: status,
-        总字符数: content.length,
-        读取起点: start,
-        文本: shown,
-        next_offset: nextOffset < content.length ? nextOffset : null,
-        提示: status.indexed ? "已建向量索引，也可先用 semantic_search 定位" : "本篇未建向量索引：只能按原文读取（较慢），可在 SageRead 设置中向量化提速",
-      });
     }
-    const oebps = findBookOebpsDir(ref.id);
-    if (!oebps) return fail("未找到《" + row.title + "》的 mdbook 目录：该书可能尚未完成 EPUB→mdbook 转换");
-    const target = heading ?? file;
-    if (!target) return fail("读书籍需要 heading 或 file（见 get_document_info 的目录）");
-    const resolved = resolveBookFile(oebps, target);
-    if (resolved.ambiguous) return fail("「" + target + "」匹配到多个章节，请传文件名（如 part003.md）");
-    if (!resolved.filePath) return fail(resolved.error ?? "未找到与「" + target + "」匹配的章节");
-    const content = fs.readFileSync(resolved.filePath, "utf8");
-    const start = offset ?? 0;
-    if (start >= content.length) return fail("offset " + start + " 超出本章长度（共 " + content.length + " 字符）");
-    const shown = content.slice(start, start + size);
-    const nextOffset = start + shown.length;
-    const status = bookIndexStatus(ref.id);
-    return ok({
-      doc: "book:" + ref.id,
-      标题: row.title,
-      章节: path.basename(resolved.filePath),
-      索引: status,
-      本章字符数: content.length,
-      读取起点: start,
-      文本: shown,
-      next_offset: nextOffset < content.length ? nextOffset : null,
-      提示: status.indexed ? "本书已建向量索引" : "本书未建向量索引：按原文读取较慢，可在 SageRead 设置中向量化提速",
-    });
+    try {
+      const bookDir = path.join(APP_DIR, "books", ref.id);
+      const window = await readBookWindow(bookDir, { heading, file, spine, fragment, offset, before, after: size });
+      const resolved = await resolveBookWindowImages(bookDir, window.text, window.imageSource);
+      const status = bookIndexStatus(ref.id);
+      const replay = {
+        doc: "book:" + ref.id,
+        ...(heading ? { heading } : {}),
+        ...(file ? { file } : {}),
+        ...(spine != null ? { spine } : {}),
+        ...(fragment ? { fragment } : {}),
+        ...(offset != null ? { offset } : {}),
+        before: before ?? 0,
+        after: size,
+      };
+      return ok({
+        doc: "book:" + ref.id,
+        标题: row.title,
+        章节: window.matchedTitle,
+        spine: window.spineIndex,
+        索引: status,
+        index: { status: status.indexed ? "indexed" : "not_indexed" },
+        anchor: window.anchor,
+        range: { start: window.start, end: window.end, unit: "char" },
+        read: replay,
+        text: resolved.text,
+        total_chars: window.totalChars,
+        truncated: window.truncated,
+        本章字符数: window.totalChars,
+        总字符数: window.totalChars,
+        读取起点: window.start,
+        文本: resolved.text,
+        next_offset: window.nextOffset,
+        ...(resolved.cacheDir
+          ? {
+              图片缓存: {
+                目录: resolved.cacheDir,
+                用途: "仅物化当前返回窗口内且 mdbook 缺盘的 EPUB 图片；不整书预提取",
+                本次窗口图片数: resolved.materialized.length,
+              },
+            }
+          : {}),
+        提示: status.indexed ? "本书已建向量索引" : "本书未建向量索引：本次按 canonical 原文读取，可在 SageRead 设置中向量化提速",
+      });
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
   },
 );
 
@@ -2040,15 +2056,19 @@ server.tool(
 
 server.tool(
   "search_library",
-  "统一检索入口：对书库/论文库/跨库做语义检索，返回统一的 doc 锚点（book:<id> / paper:<id>）与片段；可用 doc 限定单本/单篇，命中后接 read_document 精读（需 SageRead 运行且向量模型就绪）",
+  "统一检索入口：书库/论文库/跨库的语义+关键词互补检索；未索引或无向量配置也能按标题/关键词搜索。返回 doc、snippet、read、source、index、anchor_precision 与有界 next_cursor，hit.read 可直接交 read_document 扩窗",
   {
-    query: z.string().describe("查询文本（自然语言，将以当前嵌入模型向量化后做近邻检索）"),
+    query: z.string().min(1).describe("查询文本（自然语言或关键词；有向量通道时同时执行语义检索）"),
     scope: z.enum(["all", "papers", "books"]).optional().describe("可选：检索范围（all=跨库，papers=论文库，books=书库），默认 all"),
-    doc: z.string().optional().describe("可选：限定单个文档，book:<id> 或 paper:<id>（与 scope 冲突时报错）"),
+    doc: z.string().optional().describe("可选：限定单个文档，book:<id> 或 paper:<id>（与 scope 冲突时报错；不支持 cursor）"),
     collection: z.string().optional().describe("可选：限定某个收藏文件夹内的论文（文件夹名子串或 id；仅论文域生效）"),
-    top_k: z.number().int().min(1).max(30).optional().describe("可选：返回条数，默认 8，上限 30"),
+    top_k: z.number().int().min(1).max(30).default(6).describe("可选：返回条数，默认 6，上限 30"),
+    vector_weight: z.number().min(0).max(1).default(0.7).describe("可选：向量检索权重，默认 0.7；与 bm25_weight 归一化"),
+    bm25_weight: z.number().min(0).max(1).default(0.3).describe("可选：BM25 关键词权重，默认 0.3；与 vector_weight 归一化"),
+    include_references: z.boolean().default(false).describe("可选：是否包含 References/参考文献区段，默认 false"),
+    cursor: z.string().optional().describe("可选：library/all 上次返回的 next_cursor；query/scope/collection 必须一致"),
   },
-  async ({ query, scope, doc, collection, top_k }) => {
+  async ({ query, scope, doc, collection, top_k, vector_weight, bm25_weight, include_references, cursor }) => {
     let ref: DocRef | undefined;
     if (doc) {
       const parsed = parseDocRef(doc);
@@ -2076,21 +2096,6 @@ server.tool(
     if (collection && derivedScope === "books") {
       return fail("collection 仅适用于论文库（scope=papers/all 或 doc=paper:<id>）");
     }
-    // 显式限定单个文档且未建向量索引：直接返回可行动的空结果，避免无意义的嵌入调用
-    if (ref) {
-      const status = ref.kind === "paper" ? paperIndexStatus(ref.id) : bookIndexStatus(ref.id);
-      if (!status.indexed) {
-        return ok({
-          查询: query,
-          范围: derivedScope,
-          限定: `${ref.kind}:${ref.id}`,
-          结果数: 0,
-          结果: [],
-          提示: `该${ref.kind === "paper" ? "论文" : "书籍"}未建向量索引：可先用 get_document_info 看目录，再用 read_document 按 ${ref.kind === "paper" ? "heading" : "heading/file"} 精读，或在 SageRead 中向量化后重试`,
-        });
-      }
-    }
-    // collection → 文件夹成员 paper_id 集合（与 semantic_search 的过滤语义保持一致）
     let paperIds: string[] | undefined;
     if (collection) {
       const folder = findFolder(collection);
@@ -2107,62 +2112,50 @@ server.tool(
       ).map((r) => r.paper_id);
     }
     try {
-      const result = await semanticSearch(APP_DIR, {
+      const documents = db
+        .prepare("SELECT id, title, author, format FROM books WHERE trashed_at IS NULL ORDER BY id")
+        .all() as { id: string; title: string; author: string | null; format: string }[];
+      const result = await searchLibrary(APP_DIR, {
         query,
         scope: derivedScope,
-        paperId: ref?.kind === "paper" ? ref.id : undefined,
+        doc: ref,
+        collection,
         paperIds,
-        bookId: ref?.kind === "book" ? ref.id : undefined,
-        topK: top_k ?? 8,
+        documents,
+        topK: top_k,
+        vectorWeight: vector_weight,
+        bm25Weight: bm25_weight,
+        includeReferences: include_references,
+        cursor,
       });
-      // 书库向量目录里可能包含 __app_manual__ / __repo_wiki__ 等非书库文档：
-      // 它们无法被 DocRef 读取，跳过以保证每条结果的 doc 锚点都可直接使用
-      const skippedInternal: string[] = [];
-      const items = result.结果.flatMap((item) => {
-        const id = item.出处.id;
-        if (!id || !db.prepare("SELECT 1 FROM books WHERE id = ?").get(id)) {
-          if (id) skippedInternal.push(id);
-          return [];
-        }
-        const docAnchor = `${item.出处.类型 === "论文" ? "paper" : "book"}:${id}`;
-        return [
-          {
-            rank: item.rank,
-            doc: docAnchor,
-            类型: item.出处.类型,
-            标题: item.出处.书名,
-            作者: item.出处.作者,
-            章节: item.出处.章节,
-            文件: item.出处.文件 ? path.basename(item.出处.文件) : null,
-            块位置: item.出处.块位置,
-            相似度: item.相似度,
-            片段: item.内容,
-            下一步: `read_document(doc='${docAnchor}')`,
-          },
-        ];
-      });
-      const warnings = [
-        ...(result.警告 ?? []),
-        ...(skippedInternal.length
-          ? [`已跳过 ${skippedInternal.length} 条非书库文档的命中（内部手册/知识库等，没有可用的 DocRef）`]
-          : []),
-      ];
-      const hint = items.length
-        ? undefined
-        : "未命中：可换关键词、放宽 scope，或先用 list_books / list_papers 浏览元数据后再读原文";
+      const items = result.results.map((hit, index) => ({
+        ...hit,
+        rank: index + 1,
+        下一步: `read_document(doc='${hit.doc}')`,
+      }));
       return ok({
         查询: query,
         范围: derivedScope,
         ...(ref ? { 限定: `${ref.kind}:${ref.id}` } : {}),
         结果数: items.length,
         结果: items,
-        ...(warnings.length ? { 警告: warnings } : {}),
-        ...(hint ? { 提示: hint } : {}),
+        query,
+        scope: derivedScope,
+        results: items,
+        total: result.total,
+        ...(result.book_total != null ? { book_total: result.book_total } : {}),
+        ...(result.paper_total != null ? { paper_total: result.paper_total } : {}),
+        search_config: result.search_config,
+        partial: result.partial,
+        truncated: result.truncated,
+        fallback: result.fallback,
+        next_cursor: result.next_cursor ?? null,
+        errors: result.errors,
+        警告: result.errors,
+        ...(result.note ? { 提示: result.note } : {}),
       });
     } catch (err) {
-      return fail(
-        `检索失败（语义检索需要 SageRead 运行且向量模型就绪）：${err instanceof Error ? err.message : String(err)}`,
-      );
+      return fail(`检索失败：${err instanceof Error ? err.message : String(err)}`);
     }
   },
 );

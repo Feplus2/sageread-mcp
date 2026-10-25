@@ -21,6 +21,7 @@ interface LocalChannel {
 
 /** 读取 SageRead 写入的本地通道凭据（app 未运行时文件不存在/陈旧，连接失败时降级提示） */
 function readLocalChannel(appDir: string): LocalChannel | null {
+  if (process.env.SAGEREAD_DISABLE_EMBED === "1") return null;
   const file = path.join(appDir, "mcp-local.json");
   if (!fs.existsSync(file)) return null;
   try {
@@ -67,7 +68,7 @@ async function embedViaApp(appDir: string, text: string): Promise<number[]> {
 
 // ---------- 向量库检索 ----------
 
-interface ChunkRow {
+export interface ChunkRow {
   id: number;
   book_title: string | null;
   book_author: string | null;
@@ -81,6 +82,7 @@ interface ChunkRow {
   global_chunk_index: number | null;
   created_at: string | null;
   distance: number;
+  searchChannel?: "hybrid" | "bm25";
 }
 
 /** 从 vec0 建表 SQL 的 FLOAT[N] 解析索引维度 */
@@ -92,16 +94,141 @@ function readIndexDimension(db: Database.Database): number | null {
   return match ? Number(match[1]) : null;
 }
 
-/** 在单个 vectors.sqlite 中做 top-k 检索，返回带 distance 的行 */
+interface HybridSearchOptions {
+  query: string;
+  vectorWeight: number;
+  bm25Weight: number;
+  includeReferences: boolean;
+}
+
+interface ScoredChunk {
+  row: ChunkRow;
+  score: number;
+}
+
+function normalizeScores(rows: ScoredChunk[], preserveUniform = false): number[] {
+  if (!rows.length) return [];
+  const scores = rows.map((item) => item.score);
+  const min = Math.min(...scores);
+  const max = Math.max(...scores);
+  if (Math.abs(max - min) < Number.EPSILON) {
+    return preserveUniform ? scores.map((score) => Math.max(0, score)) : scores.map(() => 1);
+  }
+  return scores.map((score) => (score - min) / (max - min));
+}
+
+function queryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/u)
+    .filter((word) => word.length > 1)
+    .map((word) => word.replace(/[^\p{L}\p{N}]/gu, ""))
+    .filter(Boolean);
+}
+
+function termFrequency(term: string, text: string): number {
+  const foldedText = text.toLowerCase();
+  const foldedTerm = term.toLowerCase();
+  let count = 0;
+  let offset = 0;
+  while ((offset = foldedText.indexOf(foldedTerm, offset)) >= 0) {
+    count += 1;
+    offset += foldedTerm.length;
+  }
+  return count;
+}
+
+function searchBm25(
+  db: Database.Database,
+  query: string,
+  limit: number,
+  excludeReferences: boolean,
+): ScoredChunk[] {
+  const terms = queryTerms(query);
+  if (!terms.length) return [];
+  const stats = db
+    .prepare("SELECT COUNT(*) AS total_docs, AVG(LENGTH(chunk_text)) AS avg_length FROM document_chunks")
+    .get() as { total_docs: number; avg_length: number | null };
+  if (!stats.total_docs) return [];
+  const scores = new Map<number, number>();
+  const referenceFilter = excludeReferences ? " AND is_references = 0" : "";
+  for (const term of terms) {
+    const rows = db
+      .prepare(
+        `SELECT id, chunk_text, LENGTH(chunk_text) AS doc_length FROM document_chunks
+         WHERE (LOWER(chunk_text) LIKE ? OR LOWER(related_chapter_titles) LIKE ? OR LOWER(book_title) LIKE ?)${referenceFilter}`,
+      )
+      .all(`%${term}%`, `%${term}%`, `%${term}%`) as {
+      id: number;
+      chunk_text: string | null;
+      doc_length: number;
+    }[];
+    const matching = rows
+      .map((row) => ({ ...row, tf: termFrequency(term, row.chunk_text ?? "") }))
+      .filter((row) => row.tf > 0);
+    const df = matching.length;
+    if (!df) continue;
+    const idfArg = (stats.total_docs - df + 0.5) / (df + 0.5);
+    const idf = idfArg > 0 ? Math.log(idfArg) : 0;
+    const averageLength = stats.avg_length && stats.avg_length > 0 ? stats.avg_length : 1;
+    for (const row of matching) {
+      const numerator = row.tf * 2.2;
+      const denominator = row.tf + 1.2 * (0.25 + 0.75 * (row.doc_length / averageLength));
+      scores.set(row.id, (scores.get(row.id) ?? 0) + idf * (numerator / denominator));
+    }
+  }
+  const ranked = [...scores.entries()].sort((left, right) => right[1] - left[1]).slice(0, limit);
+  const statement = db.prepare("SELECT dc.*, 0 AS distance FROM document_chunks dc WHERE dc.id = ?");
+  return ranked.flatMap(([id, score]) => {
+    const row = statement.get(id) as ChunkRow | undefined;
+    return row ? [{ row, score }] : [];
+  });
+}
+
+function combineHybrid(
+  vectorRows: ScoredChunk[],
+  bm25Rows: ScoredChunk[],
+  vectorWeight: number,
+  bm25Weight: number,
+  limit: number,
+): ChunkRow[] {
+  const normalizedVector = normalizeScores(vectorRows, true);
+  const normalizedBm25 = normalizeScores(bm25Rows);
+  const rows = new Map<number, { row: ChunkRow; vector?: number; bm25?: number; order: number }>();
+  vectorRows.forEach((item, index) => {
+    rows.set(item.row.id, { row: item.row, vector: normalizedVector[index], order: index });
+  });
+  bm25Rows.forEach((item, index) => {
+    const existing = rows.get(item.row.id);
+    if (existing) existing.bm25 = normalizedBm25[index];
+    else rows.set(item.row.id, { row: item.row, bm25: normalizedBm25[index], order: vectorRows.length + index });
+  });
+  return [...rows.values()]
+    .map((item) => ({
+      ...item,
+      combined: vectorWeight * (item.vector ?? 0) + bm25Weight * (item.bm25 ?? 0),
+    }))
+    .sort((left, right) => right.combined - left.combined || left.order - right.order)
+    .slice(0, limit)
+    .map((item) => ({
+      ...item.row,
+      distance: 1 - item.combined,
+      searchChannel: item.bm25 !== undefined && bm25Weight > 0
+        ? item.vector !== undefined && vectorWeight > 0 ? "hybrid" : "bm25"
+        : "hybrid",
+    }));
+}
+
 function searchVectorDb(
   dbPath: string,
   queryVector: number[],
   k: number,
+  hybrid?: HybridSearchOptions,
+  warnings: string[] = [],
 ): ChunkRow[] {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     sqliteVec.load(db);
-    // 空/损坏的 vectors.sqlite（只有表结构、没有向量表）不应拖垮跨库检索：给出明确原因由上层跳过
     const hasEmbeddingTable = db
       .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'chunk_embeddings'`)
       .get() as { ok: number } | undefined;
@@ -114,13 +241,29 @@ function searchVectorDb(
         `向量索引维度 ${indexDim} 与当前嵌入模型维度 ${queryVector.length} 不一致：请在 SageRead 中对该库重建向量索引`,
       );
     }
-    return db
-      .prepare(
-        `SELECT dc.*, ce.distance FROM chunk_embeddings ce
-         JOIN document_chunks dc ON dc.id = ce.chunk_id
-         WHERE ce.embedding MATCH ? AND k = ?`,
-      )
-      .all(JSON.stringify(queryVector), k) as ChunkRow[];
+    const hasReferencesColumn = (db.prepare("PRAGMA table_info(document_chunks)").all() as { name: string }[])
+      .some((column) => column.name === "is_references");
+    const excludeReferences = hybrid ? !hybrid.includeReferences : false;
+    if (excludeReferences && !hasReferencesColumn) {
+      warnings.push("旧向量库缺少 is_references 列：无法排除索引参考文献，已保留全部索引命中并继续关键词回退");
+    }
+    const referenceFilter = excludeReferences && hasReferencesColumn ? " AND dc.is_references = 0" : "";
+    const candidateLimit = hybrid ? k * 2 : k;
+    const vectorRows = hybrid?.vectorWeight === 0
+      ? []
+      : (db
+          .prepare(
+            `SELECT dc.*, ce.distance FROM chunk_embeddings ce
+             JOIN document_chunks dc ON dc.id = ce.chunk_id
+             WHERE ce.embedding MATCH ? AND k = ?${referenceFilter}`,
+          )
+          .all(JSON.stringify(queryVector), candidateLimit) as ChunkRow[]);
+    if (!hybrid) return vectorRows;
+    const scoredVector = vectorRows.map((row) => ({ row, score: 1 - row.distance }));
+    const scoredBm25 = hybrid.bm25Weight === 0
+      ? []
+      : searchBm25(db, hybrid.query, candidateLimit, excludeReferences && hasReferencesColumn);
+    return combineHybrid(scoredVector, scoredBm25, hybrid.vectorWeight, hybrid.bm25Weight, k);
   } finally {
     db.close();
   }
@@ -136,6 +279,10 @@ export interface SemanticSearchOptions {
   paperIds?: string[];
   bookId?: string;
   topK: number;
+  vectorWeight?: number;
+  bm25Weight?: number;
+  includeReferences?: boolean;
+  strict?: boolean;
 }
 
 export interface SemanticSearchItem {
@@ -188,10 +335,20 @@ function toItem(row: ChunkRow, rank: number, fallbackBookId?: string): SemanticS
   };
 }
 
-export async function semanticSearch(
+export interface IndexedChunk {
+  row: ChunkRow;
+  fallbackBookId?: string;
+}
+
+export interface SearchIndexedResult {
+  chunks: IndexedChunk[];
+  warnings: string[];
+}
+
+export async function searchIndexed(
   appDir: string,
   options: SemanticSearchOptions,
-): Promise<SemanticSearchResult> {
+): Promise<SearchIndexedResult> {
   const { query, scope, paperId, paperIds, bookId, topK } = options;
 
   // I2：嵌入经 SageRead 本地通道（app 用自己的 keyring 密钥执行，本进程不碰密钥）；
@@ -201,6 +358,14 @@ export async function semanticSearch(
   const rows: { row: ChunkRow; fallbackBookId?: string }[] = [];
   // 跨库检索时单个库不可用（空库/维度不一致等）只跳过并记录，不让整次检索失败
   const warnings: string[] = [];
+  const hybrid = options.vectorWeight != null || options.bm25Weight != null || options.includeReferences != null
+    ? {
+        query,
+        vectorWeight: options.vectorWeight ?? 0.7,
+        bm25Weight: options.bm25Weight ?? 0.3,
+        includeReferences: options.includeReferences ?? false,
+      }
+    : undefined;
 
   // 论文库：多论文共存一库；按 paper_id / 文件夹集合过滤时 k 放大（vec0 MATCH 是全局 top-k）
   if (scope === "papers" || scope === "all") {
@@ -217,7 +382,7 @@ export async function semanticSearch(
       try {
         const needFilter = paperId !== undefined || paperIds !== undefined;
         const k = needFilter ? Math.max(topK * 10, 100) : topK;
-        let found = searchVectorDb(papersDb, queryVector, k);
+        let found = searchVectorDb(papersDb, queryVector, k, hybrid, warnings);
         if (paperIds !== undefined) {
           const set = new Set(paperIds);
           found = found.filter((r) => r.paper_id !== null && set.has(r.paper_id));
@@ -227,7 +392,7 @@ export async function semanticSearch(
         rows.push(...found.map((row) => ({ row })));
       } catch (err) {
         // 只查论文库时保持原行为（明确报错）；跨库（all）时论文库坏了仍返回书籍结果
-        if (scope === "papers") throw err;
+        if (scope === "papers" || options.strict) throw err;
         warnings.push(`论文库检索失败，已跳过：${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -258,11 +423,11 @@ export async function semanticSearch(
       if (!fs.existsSync(dbPath)) continue;
       anyDb = true;
       try {
-        const found = searchVectorDb(dbPath, queryVector, topK);
+        const found = searchVectorDb(dbPath, queryVector, topK, hybrid, warnings);
         rows.push(...found.map((row) => ({ row, fallbackBookId: dir })));
       } catch (err) {
         // 显式指定单本书时保持明确报错；枚举书库/跨库时跳过坏库并继续
-        if (bookId) throw err;
+        if (bookId || options.strict) throw err;
         warnings.push(`书籍 ${dir} 的向量库检索失败，已跳过：${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -272,13 +437,19 @@ export async function semanticSearch(
   }
 
   rows.sort((a, b) => a.row.distance - b.row.distance);
-  const items = rows.slice(0, topK).map(({ row, fallbackBookId }, i) => toItem(row, i + 1, fallbackBookId));
+  return { chunks: rows.slice(0, topK), warnings };
+}
 
+export async function semanticSearch(
+  appDir: string,
+  options: SemanticSearchOptions,
+): Promise<SemanticSearchResult> {
+  const result = await searchIndexed(appDir, { ...options, strict: true });
+  const items = result.chunks.map(({ row, fallbackBookId }, index) => toItem(row, index + 1, fallbackBookId));
   return {
-    查询: query,
-    范围: scope,
+    查询: options.query,
+    范围: options.scope,
     结果数: items.length,
     结果: items,
-    ...(warnings.length ? { 警告: warnings } : {}),
   };
 }

@@ -153,6 +153,11 @@ class McpClient {
     return res.result?.tools?.map((t) => t.name) ?? [];
   }
 
+  async listToolDetails() {
+    const res = await this.rpc("tools/list", {});
+    return res.result?.tools ?? [];
+  }
+
   async callTool(name, args, timeoutMs) {
     const res = await this.rpc("tools/call", { name, arguments: args }, timeoutMs);
     return { text: res.result?.content?.[0]?.text ?? "(无内容)", isError: res.result?.isError === true };
@@ -169,7 +174,10 @@ class McpClient {
 }
 
 // 显式关闭 legacy，保证默认断言不受调用者 shell 环境里的同名变量影响
-const client = new McpClient({ SAGEREAD_MCP_LEGACY_TOOLS: "0" });
+const client = new McpClient({
+  SAGEREAD_MCP_LEGACY_TOOLS: "0",
+  SAGEREAD_DISABLE_EMBED: withEmbed ? "0" : "1",
+});
 clients.add(client);
 
 const init = await client.initialize();
@@ -185,6 +193,16 @@ assert(toolNames.length === readmeModernCount, `默认 tools/list 数量与 READ
 for (const name of MODERN_TOOLS) assert(toolNames.includes(name), `默认集包含 ${name}`);
 for (const name of LEGACY_TOOLS) assert(!toolNames.includes(name), `默认集不包含旧工具 ${name}`);
 assert(new Set(toolNames).size === toolNames.length, "默认 tools/list 无重名工具");
+
+const toolDetails = await client.listToolDetails();
+const searchSchema = toolDetails.find((tool) => tool.name === "search_library")?.inputSchema?.properties ?? {};
+assert(searchSchema.top_k?.default === 6, "search_library schema：top_k 默认 6");
+assert(searchSchema.vector_weight?.default === 0.7, "search_library schema：vector_weight 默认 0.7");
+assert(searchSchema.bm25_weight?.default === 0.3, "search_library schema：bm25_weight 默认 0.3");
+assert(searchSchema.include_references?.default === false, "search_library schema：include_references 默认 false");
+assert(typeof searchSchema.cursor?.type === "string", "search_library schema：包含 cursor");
+const readSchema = toolDetails.find((tool) => tool.name === "read_document")?.inputSchema?.properties ?? {};
+for (const name of ["before", "after", "spine"]) assert(readSchema[name], `read_document schema：包含 ${name}`);
 
 const booksRes = await client.callTool("list_books", {});
 show("list_books（截断）", booksRes.text);
@@ -263,6 +281,19 @@ if (firstBook) {
   const bookInfo = await client.callTool("get_document_info", { doc: "book:" + firstBook });
   show("get_document_info(book)", bookInfo.text, 500);
   assert(!bookInfo.isError, "get_document_info(book) 不应报错");
+  const bookToc = JSON.parse(bookInfo.text).目录 ?? [];
+  if (bookToc.length) {
+    const bookRead = await client.callTool("read_document", {
+      doc: "book:" + firstBook,
+      spine: bookToc[0].spine,
+      after: 240,
+    }, 30000);
+    show("read_document(book, spine)（截断）", bookRead.text, 400);
+    assert(!bookRead.isError, "read_document(book, spine) 不应报错");
+    const bookWindow = JSON.parse(bookRead.text);
+    assert((bookWindow.text ?? bookWindow.文本).length > 0, "read_document(book, spine) 返回真实 EPUB 正文");
+    assert(bookWindow.read?.doc === `book:${firstBook}`, "read_document(book) 返回可重放 read");
+  }
 }
 
 // collection 取现存第一个文件夹（固定名会随库演变失效）
@@ -363,22 +394,28 @@ if (paperBook) {
 // ---- 统一检索（search_library）----
 const search = await client.callTool("search_library", { query: "cationic potential", top_k: 3 }, 90000);
 show("search_library(cationic potential)", search.text, 1200);
-const searchReady = !search.isError;
-if (search.isError) {
-  assert(
-    /SageRead 未运行|本地通道|向量模型|向量索引|向量库/.test(search.text),
-    "search_library 不可用时返回带引导的降级提示",
-  );
-  console.log("- search_library 降级（需要 SageRead 运行且向量模型就绪），跳过结果断言");
-} else {
-  const parsed = JSON.parse(search.text);
-  assert(Array.isArray(parsed.结果), "search_library 返回 结果 数组");
-  assert(parsed.结果.length === parsed.结果数, "search_library 结果数与数组长度一致");
-  assert(parsed.范围 === "all", "search_library 默认跨库（scope=all）");
-  for (const item of parsed.结果) {
-    assert(typeof item.doc === "string" && /^(book|paper):/.test(item.doc), "search_library 结果带统一 doc 锚点");
-    assert(typeof item.片段 === "string" && typeof item.相似度 === "string", "search_library 结果带片段与相似度");
-  }
+assert(!search.isError, "search_library 无论是否有向量通道都应返回结构化结果");
+const parsed = JSON.parse(search.text);
+assert(Array.isArray(parsed.结果), "search_library 返回 结果 数组");
+assert(parsed.结果.length === parsed.结果数, "search_library 结果数与数组长度一致");
+assert(parsed.范围 === "all", "search_library 默认跨库（scope=all）");
+assert(parsed.next_cursor === null || typeof parsed.next_cursor === "string", "search_library 返回 next_cursor（null 或字符串）");
+assert(typeof parsed.partial === "boolean" && typeof parsed.truncated === "boolean", "search_library 返回 partial/truncated 边界");
+assert(parsed.fallback && typeof parsed.fallback === "object", "search_library 返回关键词回退统计");
+for (const item of parsed.结果) {
+  assert(typeof item.doc === "string" && /^(book|paper):/.test(item.doc), "search_library 结果带统一 doc 锚点");
+  assert(typeof item.片段 === "string" && typeof item.相似度 === "string", "search_library 结果带片段与相似度");
+  assert(item.read?.doc === item.doc, "search_library hit.read 可直接重放");
+  assert(["hybrid", "bm25", "keyword", "title"].includes(item.source), "search_library 结果标注 source");
+  assert(["indexed", "not_indexed"].includes(item.index?.status), "search_library 结果标注 index");
+  assert(["exact", "section"].includes(item.anchor_precision), "search_library 结果标注 anchor_precision");
+}
+const exactHit = parsed.结果.find((item) => item.anchor_precision === "exact");
+if (exactHit) {
+  const expanded = await client.callTool("read_document", { ...exactHit.read, before: 32, after: 400 }, 90000);
+  assert(!expanded.isError, "search_library exact hit 可经 read_document 扩窗");
+  const expandedBody = JSON.parse(expanded.text);
+  assert(expandedBody.read?.doc === exactHit.doc, "read_document 扩窗保持同一 DocRef");
 }
 
 // 参数校验发生在嵌入调用之前：坏 doc / doc-scope 冲突都应立即报错
@@ -397,35 +434,36 @@ if (firstPaperId) {
   assert(conflict.isError && conflict.text.includes("doc 与 scope 冲突"), "search_library 校验 doc 与 scope 冲突");
 }
 
+const embedErrors = (parsed.errors ?? []).filter((message) => /SageRead 未运行|本地通道|向量模型|嵌入失败/.test(message));
 if (withEmbed) {
-  assert(searchReady, "SAGEREAD_SMOKE_EMBED=1 时 search_library 应可用（SageRead 运行且向量模型就绪）");
-  const parsed = JSON.parse(search.text);
-  assert(parsed.结果.length > 0, "search_library 真实嵌入应至少命中 1 条");
-  // 用首条命中的 doc 锚点反向限定，验证 doc 过滤（不假设第一篇论文一定已向量化）
-  const anchor = parsed.结果[0]?.doc;
-  if (anchor) {
-    const limited = await client.callTool(
-      "search_library",
-      { query: "cationic potential", doc: anchor, top_k: 2 },
-      90000,
-    );
-    show(`search_library(doc=${anchor})`, limited.text, 800);
-    assert(!limited.isError, "search_library 按 doc 反查不应报错");
-    const lp = JSON.parse(limited.text);
-    assert(lp.结果数 > 0, "search_library 按命中 doc 反查应仍有结果");
-    for (const item of lp.结果) {
-      assert(item.doc === anchor, "search_library doc 过滤只返回该文档");
-    }
-  }
+  assert(embedErrors.length === 0, "SAGEREAD_SMOKE_EMBED=1 时真实嵌入通道不得报降级错误");
+  const hybridHit = parsed.结果.find((item) => item.source === "hybrid");
+  assert(hybridHit, "SAGEREAD_SMOKE_EMBED=1 必须至少返回一条真实 hybrid 命中");
+  const anchor = hybridHit.doc;
+  const limited = await client.callTool(
+    "search_library",
+    { query: "cationic potential", doc: anchor, top_k: 2 },
+    90000,
+  );
+  show(`search_library(doc=${anchor})`, limited.text, 800);
+  assert(!limited.isError, "search_library 按 doc 反查不应报错");
+  const lp = JSON.parse(limited.text);
+  assert(lp.结果数 > 0, "search_library 按命中 doc 反查应仍有结果");
+  for (const item of lp.结果) assert(item.doc === anchor, "search_library doc 过滤只返回该文档");
 } else {
-  console.log("- 未设置 SAGEREAD_SMOKE_EMBED=1：search_library 只做可用性/降级检查（不强制要求命中）");
+  assert(embedErrors.length > 0, "默认 smoke 强制禁用嵌入并记录真实降级诊断");
+  assert(parsed.partial === true, "无向量 smoke 明确标记 indexed 通道不可用");
+  console.log("- 默认 smoke 已通过 SAGEREAD_DISABLE_EMBED=1 验证无向量关键词/标题回退");
 }
 
 client.close();
 clients.delete(client);
 
-// ---- legacy 开关：旧工具仍可注册（只查 tools/list）----
-const legacy = new McpClient({ SAGEREAD_MCP_LEGACY_TOOLS: "1" });
+// ---- legacy 开关：旧工具注册与真实原始坐标/输出契约 ----
+const legacy = new McpClient({
+  SAGEREAD_MCP_LEGACY_TOOLS: "1",
+  SAGEREAD_DISABLE_EMBED: withEmbed ? "0" : "1",
+});
 clients.add(legacy);
 try {
   await legacy.initialize();
@@ -438,6 +476,30 @@ try {
   for (const name of MODERN_TOOLS) assert(legacyNames.includes(name), `legacy 模式仍包含现代工具 ${name}`);
   for (const name of LEGACY_TOOLS) assert(legacyNames.includes(name), `legacy 模式注册旧工具 ${name}`);
   assert(new Set(legacyNames).size === legacyNames.length, "legacy 模式 tools/list 无重名工具");
+
+  if (firstPaperId) {
+    const rawFirst = await legacy.callTool("read_paper", { paper: firstPaperId, offset: 0, limit: 12 });
+    const rawSecond = await legacy.callTool("read_paper", { paper: firstPaperId, offset: 1, limit: 11 });
+    assert(!rawFirst.isError && !rawSecond.isError, "legacy read_paper 真实原始 offset 调用不应报错");
+    const rawSlice = (text) => text.replace(/\n\n\(已截断[\s\S]*$/, "");
+    assert(rawSlice(rawSecond.text) === rawSlice(rawFirst.text).slice(1), "legacy read_paper 保持 paper.md 原始 UTF-16 offset");
+    assert(!rawFirst.text.includes("next_offset"), "legacy read_paper 不引入现代 next_offset 输出");
+  }
+
+  const legacySearch = await legacy.callTool("semantic_search", { query: "cationic potential" }, 90000);
+  show("legacy semantic_search（截断）", legacySearch.text, 800);
+  if (withEmbed) {
+    assert(!legacySearch.isError, "SAGEREAD_SMOKE_EMBED=1 时 legacy semantic_search 应成功");
+    const legacyBody = JSON.parse(legacySearch.text);
+    assert(legacyBody.结果.length > 0 && legacyBody.结果.length <= 8, "legacy semantic_search 默认最多返回 8 条");
+    for (const item of legacyBody.结果) {
+      assert(item.read === undefined && item.source === undefined, "legacy semantic_search 不引入现代 read/source 字段");
+      assert(item.出处 && typeof item.相似度 === "string", "legacy semantic_search 保留旧 出处/相似度 形状");
+    }
+  } else {
+    assert(legacySearch.isError, "无向量 smoke 下 legacy semantic_search 不伪装成关键词回退");
+    assert(/SageRead 未运行|本地通道|向量模型/.test(legacySearch.text), "legacy semantic_search 保留原降级错误风格");
+  }
 } finally {
   legacy.close();
   clients.delete(legacy);
