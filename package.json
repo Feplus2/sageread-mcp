@@ -1,6 +1,6 @@
 {
   "name": "sageread-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "书库/论文/笔记/对话/向量语义检索的 SageRead 只读 MCP",
   "type": "module",
   "bin": {
@@ -33,18 +33,24 @@
     "dist"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20.9.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^13.0.1",
+    "jsdom": "24.1.3",
+    "mathml-to-latex": "1.8.0",
+    "sharp": "^0.35.5",
     "sqlite-vec": "^0.1.9",
     "yaml": "^2.9.0",
+    "yauzl": "3.4.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/jsdom": "21.1.7",
     "@types/node": "^26.1.1",
+    "@types/yauzl": "2.10.3",
     "typescript": "^7.0.2"
   }
 }
