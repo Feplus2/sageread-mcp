@@ -21,6 +21,8 @@ import {
   readPaperDocMetadata,
   readPaperWindow,
 } from "./paper-document.js";
+import { listPaperFigures, rewritePaperImagePaths } from "./document-images.js";
+import { readImageBatch } from "./image-content.js";
 import { readBookToc, readBookWindow, resolveBookWindowImages } from "./book-document.js";
 
 // ---------- 数据路径解析 ----------
@@ -1574,15 +1576,19 @@ legacyTool(
 
 legacyTool(
   "get_chunk_context",
-  "按块序号取语义检索命中块的上下文（前后各扩 radius 块拼接，当前块有标记）；论文与书籍均支持",
+  "按块序号取语义检索命中块的上下文（前后各扩 radius 块拼接，当前块有标记）；论文与书籍均支持，目标参数可用 id 或 book_id",
   {
-    id: z.string().describe("目标 id 或名称（模糊）：书籍传 book id、论文传 paper id；对应 semantic_search 结果 出处.id"),
+    id: z.string().optional().describe("目标 id 或名称（模糊）：书籍传 book id、论文传 paper id；与 book_id 二选一"),
+    book_id: z.string().optional().describe("book_id 兼容别名：与 semantic_search 参数同名；与 id 二选一"),
     chunk_order: z.number().int().min(0).describe("命中块的序号（semantic_search 结果 块位置 的分子，即 chunk_order_in_file）"),
     radius: z.number().int().min(0).max(3).optional().describe("可选：前后各扩几块，默认 1，上限 3"),
   },
-  async ({ id, chunk_order, radius }) => {
-    const found = findBook(id);
-    if (!found) return fail(`未找到匹配的书籍: ${id}`);
+  async ({ id, book_id, chunk_order, radius }) => {
+    const target = id ?? book_id;
+    if (!target) return fail("请提供 id 或 book_id 之一");
+    if (id && book_id && id !== book_id) return fail(`id 与 book_id 不一致：${id} / ${book_id}`);
+    const found = findBook(target);
+    if (!found) return fail(`未找到匹配的书籍: ${target}`);
     const r = radius ?? 1;
     const isPaper = found.format === "MARKDOWN";
     // 论文共用 {appDir}/papers/vectors.sqlite；书籍一书一库
@@ -1861,7 +1867,7 @@ server.tool(
           heading: heading.text,
           offset: heading.contentStart,
         })),
-        图表数: (canonical.body.match(/^!\[/gm) || []).length,
+        图表数: listPaperFigures(path.join(APP_DIR, "books", ref.id), content, { limit: 1 }).total_found,
         参考文献数: referenceEntries(canonical.body).length,
       });
     }
@@ -1880,6 +1886,57 @@ server.tool(
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error));
     }
+  },
+);
+
+server.tool(
+  "list_paper_figures",
+  "列出论文中的图片（相对引用、可用绝对路径、图注与所在小节）；image_path 可直接交给 read_images 查看图片内容",
+  {
+    doc: z.string().describe("论文 DocRef：paper:<id>（也可直接传论文 id）"),
+    offset: z.number().int().min(0).optional().describe("可选：从第几张图片开始（图片序号，不是 canonical 字符坐标），默认 0"),
+    limit: z.number().int().min(1).max(50).optional().describe("可选：最多返回几张，默认 50、上限 50；用上次 next_offset 续页"),
+  },
+  async ({ doc, offset, limit }) => {
+    const parsed = parseDocRef(doc);
+    if (!parsed.ref) return fail(parsed.error!);
+    if (parsed.ref.kind !== "paper") return fail("论文图片清单仅支持论文（paper:<id>）");
+    const row = findBook(parsed.ref.id);
+    if (!row) return fail("未找到论文：" + doc);
+    if (row.format !== "MARKDOWN") return fail(`《${row.title}》不是论文（格式为 ${row.format}）`);
+    const { content, error } = readPaperMd(parsed.ref.id);
+    if (content === undefined) return fail(error!);
+    const listing = listPaperFigures(path.join(APP_DIR, "books", parsed.ref.id), content, { offset, limit });
+    return ok({ doc: "paper:" + parsed.ref.id, ...listing });
+  },
+);
+
+server.tool(
+  "read_images",
+  "查看书籍/论文图片内容：一次读取 1–6 张并返回真实图片；paths 使用 read_document 或 list_paper_figures 给出的绝对路径，仅限当前文档及其 EPUB 图片缓存",
+  {
+    doc: z.string().describe("文档引用：book:<id> 或 paper:<id>；图片只能位于该文档目录或其 EPUB 缓存内"),
+    paths: z.array(z.string().min(1)).min(1).max(6).describe("图片绝对路径数组，1–6 张；不要传 Markdown 相对路径"),
+    max_edge: z.number().int().min(512).max(1536).optional().describe("可选：单图长边像素上限，默认 1024，最大 1536；批量会按预算进一步压缩"),
+  },
+  async ({ doc, paths, max_edge }) => {
+    const parsed = parseDocRef(doc);
+    if (!parsed.ref) return fail(parsed.error!);
+    const ref = parsed.ref;
+    const row = findBook(ref.id);
+    if (!row) return fail("未找到文档：" + doc);
+    if (ref.kind === "paper" && row.format !== "MARKDOWN") return fail(`《${row.title}》不是论文（格式为 ${row.format}）`);
+    if (ref.kind === "book" && row.format === "MARKDOWN") return fail(`《${row.title}》是论文（MARKDOWN）：请改用 paper:${row.id}`);
+    const roots = [path.join(APP_DIR, "books", ref.id)];
+    if (ref.kind === "book") {
+      const safeBookId = ref.id.replace(/[^A-Za-z0-9_-]/g, "_");
+      roots.push(path.join(APP_DIR, "image-cache", "epub", safeBookId));
+    }
+    const content = await readImageBatch(paths, roots, { maxEdge: max_edge });
+    return {
+      content,
+      ...(content.some((part) => part.type === "image") ? {} : { isError: true as const }),
+    };
   },
 );
 
@@ -1909,6 +1966,7 @@ server.tool(
       if (content === undefined) return fail(error!);
       try {
         const window = readPaperWindow(content, { heading, offset, before, after: size });
+        const text = rewritePaperImagePaths(path.join(APP_DIR, "books", ref.id), window.text);
         const status = paperIndexStatus(ref.id);
         const replay = {
           doc: "paper:" + ref.id,
@@ -1925,12 +1983,12 @@ server.tool(
           anchor: window.anchor,
           range: { start: window.start, end: window.end, unit: "char" },
           read: replay,
-          text: window.text,
+          text,
           total_chars: window.totalChars,
           truncated: window.truncated,
           总字符数: window.totalChars,
           读取起点: window.start,
-          文本: window.text,
+          文本: text,
           next_offset: window.nextOffset,
           提示: status.indexed ? "已建向量索引，也可先用 search_library 定位" : "本篇未建向量索引：本次按 canonical 原文读取，可在 SageRead 设置中向量化提速",
         });

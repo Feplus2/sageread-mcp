@@ -4,6 +4,14 @@ import { createHash } from "node:crypto";
 import { JSDOM } from "jsdom";
 import * as yauzl from "yauzl";
 import { readCanonicalWindow } from "./canonical-window.js";
+import {
+  decodeRef,
+  isLocalRelativeImageRef,
+  markdownImageDestination,
+  slash,
+  stripAngle,
+  withinRoot,
+} from "./document-images.js";
 import { extractStructuredText } from "./structured-text.js";
 
 export { extractStructuredText } from "./structured-text.js";
@@ -104,24 +112,8 @@ const MAX_TEXT_ENTRY_BYTES = 64 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 const MARKDOWN_IMAGE_RE =
   /(?<!\\)!\[((?:\\[\s\S]|[^\\\]])*)\]\(\s*(<[^>\n]*>|[^)\s]+)((?:\s+"[^"]*"|\s+'[^']*'|\s+\([^)]*\))?)\s*\)/g;
-const HTML_IMG_RE = /<img\b([^>]*?)\bsrc\s*=\s*("([^"]*)"|'([^']*)')([^>]*)>/gi;
-
-function slash(value: string): string {
-  return value.replace(/\\/g, "/");
-}
-
-function stripAngle(value: string): string {
-  const trimmed = value.trim();
-  return trimmed.startsWith("<") && trimmed.endsWith(">") ? trimmed.slice(1, -1).trim() : trimmed;
-}
-
-function decodeRef(value: string): string {
-  try {
-    return decodeURI(value);
-  } catch {
-    return value;
-  }
-}
+const HTML_IMG_RE =
+  /<img\b((?:"[^"]*"|'[^']*'|[^'">])*)\bsrc\s*=\s*("([^"]*)"|'([^']*)')((?:"[^"]*"|'[^']*'|[^'">])*)>/gi;
 
 function zipPath(baseFile: string, ref: string): string {
   const clean = decodeRef(stripAngle(ref)).split("#")[0].split("?")[0].replace(/\\/g, "/");
@@ -324,7 +316,7 @@ function openMdbookModel(bookDir: string): BookModel {
   const resolveMdbookFile = (ref: string): string => {
     const candidate = path.resolve(realRoot, ref);
     const realFile = fs.realpathSync(candidate);
-    if (!withinBook(realFile, realRoot)) throw new Error(`mdbook nav 目标越出书籍目录：${ref}`);
+    if (!withinRoot(realFile, realRoot)) throw new Error(`mdbook nav 目标越出书籍目录：${ref}`);
     return realFile;
   };
   const toc: BookTocEntry[] = [];
@@ -689,18 +681,6 @@ export async function readBookWindow(bookDir: string, options: BookWindowOptions
   };
 }
 
-function isLocalRelativeImageRef(ref: string): boolean {
-  const value = stripAngle(ref);
-  if (!value || value.startsWith("#")) return false;
-  if (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/") || value.startsWith("\\")) return false;
-  return !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value);
-}
-
-function withinBook(candidate: string, bookDir: string): boolean {
-  const relative = path.relative(bookDir, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 function resolveDiskImage(bookDir: string, ref: string, relativeMdPath?: string): string | null {
   const cleanRef = decodeRef(stripAngle(ref));
   const candidates: string[] = [];
@@ -712,7 +692,7 @@ function resolveDiskImage(bookDir: string, ref: string, relativeMdPath?: string)
   }
   candidates.push(path.resolve(bookDir, cleanRef));
   for (const candidate of candidates) {
-    if (withinBook(candidate, bookDir) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+    if (withinRoot(candidate, bookDir) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
       return slash(candidate);
     }
   }
@@ -786,7 +766,7 @@ export async function resolveBookWindowImages(
     const absolute = resolved.get(`markdown:${markdownOrdinal++}`);
     if (!absolute) return whole;
     changed = true;
-    return `![${alt}](${absolute}${title ? ` ${title.trim()}` : ""})`;
+    return `![${alt}](${markdownImageDestination(absolute)}${title ? ` ${title.trim()}` : ""})`;
   });
   const rewritten = withMarkdown.replace(
     HTML_IMG_RE,

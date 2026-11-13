@@ -5,13 +5,14 @@
  *   默认测开发版库（--dev）；--release 测发行版库
  *   SAGEREAD_SMOKE_EMBED=1 时要求 search_library 的真实嵌入调用成功（默认只做可用性/降级检查）
  *
- * 默认集断言 tools/list 恰好为 18 个现代工具；结束时再以 SAGEREAD_MCP_LEGACY_TOOLS=1
- * 启动一次，仅断言 tools/list 额外注册了 7 个旧工具（共 25 个）。
+ * 默认集断言 tools/list 恰好为 20 个现代工具；结束时再以 SAGEREAD_MCP_LEGACY_TOOLS=1
+ * 启动一次，仅断言 tools/list 额外注册了 7 个旧工具（共 27 个）。
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import sharp from "sharp";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const useDev = !process.argv.includes("--release"); // 默认测开发版库
@@ -36,6 +37,8 @@ const MODERN_TOOLS = [
   "export_paper_citation",
   "search_library",
   "get_document_info",
+  "list_paper_figures",
+  "read_images",
   "read_document",
   "get_citation_graph",
 ];
@@ -160,7 +163,11 @@ class McpClient {
 
   async callTool(name, args, timeoutMs) {
     const res = await this.rpc("tools/call", { name, arguments: args }, timeoutMs);
-    return { text: res.result?.content?.[0]?.text ?? "(无内容)", isError: res.result?.isError === true };
+    return {
+      text: res.result?.content?.[0]?.text ?? "(无内容)",
+      isError: res.result?.isError === true,
+      content: res.result?.content ?? [],
+    };
   }
 
   close() {
@@ -203,6 +210,13 @@ assert(searchSchema.include_references?.default === false, "search_library schem
 assert(typeof searchSchema.cursor?.type === "string", "search_library schema：包含 cursor");
 const readSchema = toolDetails.find((tool) => tool.name === "read_document")?.inputSchema?.properties ?? {};
 for (const name of ["before", "after", "spine"]) assert(readSchema[name], `read_document schema：包含 ${name}`);
+const imageSchema = toolDetails.find((tool) => tool.name === "read_images")?.inputSchema?.properties ?? {};
+assert(imageSchema.paths?.type === "array", "read_images schema：paths 为数组");
+assert(imageSchema.paths?.maxItems === 6, "read_images schema：最多 6 张");
+assert(imageSchema.max_edge?.minimum === 512 && imageSchema.max_edge?.maximum === 1536, "read_images schema：max_edge 范围 512–1536");
+const figureSchema = toolDetails.find((tool) => tool.name === "list_paper_figures")?.inputSchema?.properties ?? {};
+assert(figureSchema.offset?.minimum === 0, "list_paper_figures schema：offset 从 0 开始");
+assert(figureSchema.limit?.maximum === 50, "list_paper_figures schema：limit 上限 50");
 
 const booksRes = await client.callTool("list_books", {});
 show("list_books（截断）", booksRes.text);
@@ -267,6 +281,37 @@ if (firstPaperId) {
   const graph = await client.callTool("get_citation_graph", { doc: "paper:" + firstPaperId }, 30000);
   show("get_citation_graph(paper)", graph.text, 500);
   assert(!graph.isError, "get_citation_graph(paper) 不应报错");
+
+  const figures = await client.callTool("list_paper_figures", { doc: "paper:" + firstPaperId });
+  show("list_paper_figures(paper)", figures.text, 600);
+  assert(!figures.isError, "list_paper_figures(paper) 不应报错");
+  const figureBody = JSON.parse(figures.text);
+  assert(Number.isInteger(figureBody.total_found), "list_paper_figures 返回全量图片数 total_found");
+  if (figureBody.total_found > 1) {
+    const firstPage = await client.callTool("list_paper_figures", { doc: "paper:" + firstPaperId, limit: 1 });
+    const pageBody = JSON.parse(firstPage.text);
+    assert(pageBody.total === 1 && pageBody.total_found === figureBody.total_found, "list_paper_figures limit=1 保留全量计数");
+    assert(pageBody.next_offset === 1, "list_paper_figures 首页返回 next_offset=1");
+  }
+  const imagePath = figureBody.figures?.find((figure) => figure.image_path)?.image_path;
+  if (imagePath) {
+    const image = await client.callTool("read_images", {
+      doc: "paper:" + firstPaperId,
+      paths: [imagePath],
+      max_edge: 512,
+    }, 30000);
+    assert(!image.isError, "read_images(paper) 真实图片不应报错");
+    const imageParts = image.content.filter((part) => part.type === "image");
+    assert(imageParts.length === 1, "read_images(paper) 返回一个真实 image content");
+    assert(imageParts[0].mimeType === "image/jpeg", "read_images(paper) 返回 JPEG");
+    assert(imageParts[0].data.length > 0, "read_images(paper) 返回非空 base64");
+    const decoded = await sharp(Buffer.from(imageParts[0].data, "base64")).metadata();
+    assert(decoded.format === "jpeg", "read_images(paper) 返回内容可再次解码为 JPEG");
+    assert(Math.max(decoded.width ?? 0, decoded.height ?? 0) <= 512, "read_images(paper) 遵守 max_edge=512");
+    console.log(`✓ 真实论文图片已读取：${imagePath}（base64 ${imageParts[0].data.length} 字符）`);
+  } else {
+    console.log("- 当前论文没有可读取的图片文件，真实图片 content 未在本库验收");
+  }
 }
 
 const firstBook = (() => {

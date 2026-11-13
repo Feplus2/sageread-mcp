@@ -3,10 +3,11 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { JSDOM } from "jsdom";
-import { createFixtureApp, McpClient, toolJson, writeEpubFixture as registerEpub } from "./test-helpers.mjs";
+import { addVectorChunk, createFixtureApp, createVectorDb, McpClient, toolJson, writeEpubFixture as registerEpub } from "./test-helpers.mjs";
 
 const paper = await import("../dist/paper-document.js").catch(() => null);
 const book = await import("../dist/book-document.js").catch(() => null);
+const slash = (value) => value.replace(/\\/g, "/");
 const parsedFixture = `---\r\ntitle: Window fixture\r\n---\r\n# Alpha\r\nBefore\r\n$$x^2$$\r\n😀\r\n# Beta\r\n12345`;
 const sectionText = `${"A".repeat(400)}😀${"0123456789abcdefghijklmnopqrstuvwxyz".repeat(48).slice(0, 1698)}`;
 const windowMarkdown = `---\ntitle: Window fixture\n---\n# Alpha\n${sectionText}\n# Beta\n12345`;
@@ -539,6 +540,51 @@ test("References heading is not counted as an entry and ref_index starts at one"
     assert.equal(graph.isError, false, graph.text);
     assert.equal(toolJson(graph).引用了库内[0].ref_index, 1);
   } finally {
+    await client.close();
+    app.cleanup();
+  }
+});
+
+test("book image resolution accepts legitimate directories beginning with two dots", async () => {
+  assert.equal(typeof book?.readBookDocumentCanonical, "function");
+  assert.equal(typeof book?.resolveBookWindowImages, "function");
+  if (!book?.readBookDocumentCanonical || !book?.resolveBookWindowImages) return;
+  const app = createFixtureApp();
+  try {
+    app.addBook({ id: "dot-directory-book", format: "EPUB" });
+    app.writeBookFile("dot-directory-book", "..foo/image.png", Buffer.from([1]));
+    const root = path.join(app.appDir, "books", "dot-directory-book");
+    const text = "![Dot](..foo/image.png)";
+    const source = { text, totalChars: text.length, bookDir: root, segments: [], source: "mdbook", windowStart: 0 };
+    const resolved = await book.resolveBookWindowImages(root, text, source);
+    assert.ok(resolved.text.includes(slash(path.join(root, "..foo", "image.png"))), resolved.text);
+  } finally {
+    app.cleanup();
+  }
+});
+
+test("legacy get_chunk_context accepts book_id as a backwards-compatible alias", async () => {
+  const app = createFixtureApp();
+  const client = new McpClient(app.dbPath, { SAGEREAD_MCP_LEGACY_TOOLS: "1" });
+  let vectors;
+  try {
+    app.addBook({ id: "legacy-alias-book", format: "EPUB" });
+    vectors = createVectorDb(path.join(app.appDir, "books", "legacy-alias-book", "vectors.sqlite"));
+    addVectorChunk(vectors, {
+      book_title: "legacy-alias-book",
+      md_file_path: "part.md",
+      chunk_order_in_file: 7,
+      total_chunks_in_file: 8,
+      chunk_text: "legacy alias context",
+    });
+    vectors.close();
+    app.close();
+    await client.initialize();
+    const response = await client.callTool("get_chunk_context", { book_id: "legacy-alias-book", chunk_order: 7, radius: 0 });
+    assert.equal(response.isError, false, response.text);
+    assert.ok(response.text.includes("legacy alias context"), response.text);
+  } finally {
+    if (vectors?.open) vectors.close();
     await client.close();
     app.cleanup();
   }
